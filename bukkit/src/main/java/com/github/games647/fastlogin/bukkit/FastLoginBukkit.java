@@ -163,6 +163,12 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
     public void onEnable() {
         core = new FastLoginCore<>(this);
         core.load();
+        // Anchor the optional identity engine in the shaded artifact. Shadow's
+        // minimizer otherwise strips unreferenced prototype classes even though
+        // they compile and pass JUnit. This does NOT activate claims, password
+        // routing, or migration on any live player.
+        logger.info("Cyoria Identity {}: prototype staged, login/claim/migration DISABLED",
+                com.github.games647.fastlogin.core.identity.CyoriaIdentityRegistry.class.getSimpleName());
 
         // Detect AuthMe version and initialize compatibility layer
         authMeVersionDetector = new AuthMeVersionDetector();
