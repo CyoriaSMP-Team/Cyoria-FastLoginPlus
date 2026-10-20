@@ -96,7 +96,16 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                         core.getPlugin().getLog()
                             .info("Requesting premium login for registered player: {}", username);
                     }
-                    requestPremiumLogin(source, profile, username, true);
+                    if ((boolean) core.getConfig().get("requireJavaPasswordEnrollment")
+                            && core.hasFailedLogin(ip, username)) {
+                        // A failed Mojang handshake must never auto-login: ask for AuthMe password.
+                        startCrackedSession(source, profile, username);
+                    } else {
+                        requestPremiumLogin(source, profile, username, true);
+                    }
+                } else if ((boolean) core.getConfig().get("requireJavaPasswordEnrollment")) {
+                    // Re-check Mojang session proof without altering offline account ownership.
+                    return profile;
                 } else {
                     if (isValidUsername(source, profile)) {
                         startCrackedSession(source, profile, username);
@@ -220,9 +229,18 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
         if (core.isDebug()) {
             core.getPlugin().getLog().info("GameProfile {} uses a premium username", username);
         }
-        if ((boolean) core.getConfig().get("autoRegister") && (authHook == null || !authHook.isRegistered(username))) {
-            requestPremiumLogin(source, profile, username, false);
-            return true;
+        if ((boolean) core.getConfig().get("autoRegister")) {
+            boolean alreadyRegistered = authHook != null && authHook.isRegistered(username);
+            if ((boolean) core.getConfig().get("requireJavaPasswordEnrollment")) {
+                // A Mojang name lookup alone does not grant auth. Only a later
+                // successful hasJoined challenge can produce a verified session.
+                requestPremiumLogin(source, profile, username, alreadyRegistered);
+                return true;
+            }
+            if (!alreadyRegistered) {
+                requestPremiumLogin(source, profile, username, false);
+                return true;
+            }
         }
 
         if ((boolean) core.getConfig().get("offline-whitelist")) {

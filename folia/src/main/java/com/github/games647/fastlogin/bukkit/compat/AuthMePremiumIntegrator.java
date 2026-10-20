@@ -188,6 +188,27 @@ public final class AuthMePremiumIntegrator {
         }
     }
 
+    /** Does AuthMe hold an actual user-chosen password hash? Fail closed on errors. */
+    public boolean hasPasswordEnrollment(String playerName) {
+        if (!versionDetector.isAuthMe6() || playerName == null) {
+            return false;
+        }
+        try {
+            Object ds = getDataSource();
+            if (ds == null) return false;
+            Object auth = ds.getClass().getMethod("getAuth", String.class)
+                .invoke(ds, playerName.toLowerCase(java.util.Locale.ROOT));
+            if (auth == null) return false;
+            Object password = auth.getClass().getMethod("getPassword").invoke(auth);
+            if (password == null) return false;
+            Object hash = password.getClass().getMethod("getHash").invoke(password);
+            return hash instanceof String && !((String) hash).isEmpty();
+        } catch (Exception ex) {
+            plugin.getLog().warn("Could not verify AuthMe password enrollment for {}", playerName);
+            return false;
+        }
+    }
+
     /**
      * Directly set the premium UUID in AuthMe's database for the given player.
      * If the player has no AuthMe DB record (first login), pre-creates one
@@ -239,6 +260,10 @@ public final class AuthMePremiumIntegrator {
             // Get the auth record
             Method getAuth = dataSource.getClass().getMethod("getAuth", String.class);
             Object auth = getAuth.invoke(dataSource, lowerName);
+            if (auth == null && plugin.getCore().getConfig().getBoolean("requireJavaPasswordEnrollment")) {
+                // A first-time Java account MUST register with its own password.
+                return false;
+            }
             if (auth == null) {
                 // First login: no AuthMe DB record yet. Pre-create one with the
                 // premium UUID so that shouldSkipPreJoinDialogForPremium() sees
@@ -310,6 +335,20 @@ public final class AuthMePremiumIntegrator {
         // 0.7.0/F20: let this administrative switch win over a premium marking that is still in
         // flight for the same player — that task would otherwise re-create the record below.
         plugin.markCrackedOverride(lowerName);
+
+        if (versionDetector.isAuthMe6()
+                && plugin.getCore().getConfig().getBoolean("requireJavaPasswordEnrollment")) {
+            // Do not delete/overwrite a player's real AuthMe registration.
+            try {
+                Object ds = getDataSource();
+                if (ds == null) return;
+                Object auth = ds.getClass().getMethod("getAuth", String.class).invoke(ds, lowerName);
+                if (auth != null) clearPremiumStatusPreservingPassword(playerName, auth, ds);
+            } catch (Exception ex) {
+                plugin.getLog().warn("Failed to safely clear premium state for {}", playerName);
+            }
+            return;
+        }
 
         if (versionDetector.isAuthMe6()) {
             // AuthMe 6.0: clear caches + DB premium flag + forceUnregister.
@@ -544,7 +583,11 @@ public final class AuthMePremiumIntegrator {
                     "ensureNotPremium: {} STALE (isPremium=true) → triggering cleanup",
                     playerName);
             }
-            clearPlayerPremium(playerName);
+            if (plugin.getCore().getConfig().getBoolean("requireJavaPasswordEnrollment")) {
+                clearPremiumStatusPreservingPassword(playerName, auth, ds);
+            } else {
+                clearPlayerPremium(playerName);
+            }
         } catch (Exception e) {
             if (plugin.getCore().isDebug()) {
                 plugin.getLog().info(
@@ -680,6 +723,51 @@ public final class AuthMePremiumIntegrator {
             return ProxySyncDecision.SKIP;
         }
         return carrierAvailable ? ProxySyncDecision.SEND : ProxySyncDecision.QUEUE;
+    }
+
+    /**
+     * Called only AFTER a successful Mojang hasJoined proof, before AuthMe's
+     * pre-join dialog. Clears a legacy premium flag to require manual enrollment.
+     * Never unregisters the account or changes the password hash.
+     */
+    public boolean prepareManualPasswordEnrollment(String playerName) {
+        if (!versionDetector.isAuthMe6()) return false;
+        try {
+            Object ds = getDataSource();
+            if (ds == null) return false;
+            Object auth = ds.getClass().getMethod("getAuth", String.class)
+                .invoke(ds, playerName.toLowerCase(java.util.Locale.ROOT));
+            if (auth == null) return true;
+            boolean premium = (boolean) auth.getClass().getMethod("isPremium").invoke(auth);
+            return !premium || clearPremiumStatusPreservingPassword(playerName, auth, ds);
+        } catch (Exception ex) {
+            plugin.getLog().warn("Could not clear legacy premium status for manual enrollment: {}", playerName);
+            return false;
+        }
+    }
+
+    /** Removes a stale AuthMe premium UUID while preserving the actual password hash. */
+    private boolean clearPremiumStatusPreservingPassword(String playerName, Object auth, Object ds)
+            throws Exception {
+        String lower = playerName.toLowerCase(java.util.Locale.ROOT);
+        Object pending = getPendingPremiumCache();
+        if (pending != null) {
+            pending.getClass().getMethod("removePending", String.class).invoke(pending, lower);
+        }
+        Object verifier = getPremiumLoginVerifier();
+        if (verifier != null) {
+            Field field = verifier.getClass().getDeclaredField("verified");
+            field.setAccessible(true);
+            Object map = field.get(verifier);
+            if (map instanceof java.util.Map) ((java.util.Map<?, ?>) map).remove(lower);
+        }
+        auth.getClass().getMethod("setPremiumUuid", UUID.class).invoke(auth, (UUID) null);
+        boolean saved = (boolean) ds.getClass().getMethod("updatePremiumUuid", auth.getClass())
+            .invoke(ds, auth);
+        if (!saved) {
+            plugin.getLog().warn("Unable to clear AuthMe premium status for {}", playerName);
+        }
+        return saved;
     }
 
     /**

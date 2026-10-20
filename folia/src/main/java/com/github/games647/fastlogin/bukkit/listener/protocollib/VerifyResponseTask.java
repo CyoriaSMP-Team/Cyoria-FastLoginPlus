@@ -232,11 +232,29 @@ public class VerifyResponseTask implements Runnable {
         session.setVerifiedUsername(realUsername);
         session.setUuid(verification.getId());
         session.setVerifiedPremium(true);
+        // A successful Mojang hasJoined response must never be treated as a
+        // failed verification on the following reconnect.
+        if (plugin.getCore().getConfig().getBoolean("secondAttemptCracked")) {
+            plugin.getCore().hasFailedLogin(player.getAddress().getAddress().getHostAddress(), requestedUsername);
+        }
 
         // AuthMe 6.0 premium integration: inject state to skip Pre-Join dialog
         com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
             plugin.getAuthMePremiumIntegrator();
-        if (integrator != null && integrator.isAuthMePremiumEnabled()) {
+        boolean manualEnrollment = plugin.getCore().getConfig().getBoolean("requireJavaPasswordEnrollment");
+        boolean boundAndEnrolled = session.getProfile() != null
+            && session.getProfile().isOnlinemodePreferred()
+            && integrator != null && integrator.hasPasswordEnrollment(requestedUsername);
+        if (manualEnrollment && !boundAndEnrolled && integrator != null) {
+            // A legacy AuthMe premiumUuid must not bypass the initial manual
+            // password step. Clear only that flag; keep the password hash.
+            if (!integrator.prepareManualPasswordEnrollment(requestedUsername)) {
+                disconnect("error-kick", "Could not safely prepare password enrollment for {}", requestedUsername);
+                return;
+            }
+        }
+        if (integrator != null && integrator.isAuthMePremiumEnabled()
+                && (!manualEnrollment || boundAndEnrolled)) {
             // Last-resort re-assert: the events that make AuthMe start its own premium listener
             // are covered by AuthMeTakeoverListener, and the reload path is prevented at the
             // source (FLP leaves AuthMe's flag at "registered"). This covers what neither can see —

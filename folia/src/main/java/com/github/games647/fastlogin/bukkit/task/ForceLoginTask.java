@@ -72,7 +72,13 @@ public class ForceLoginTask extends ForceLoginManagement<Player, CommandSender, 
 
         super.run();
 
-        if (session != null && session.isVerifiedPremium()) {
+        boolean javaPlayer = session != null && session.getProfile() != null
+            && session.getProfile().getFloodgate() != FloodgateState.TRUE
+            && session.getProfile().getFloodgate() != FloodgateState.LINKED;
+        if (session != null && session.isVerifiedPremium() && javaPlayer
+                && (!core.getConfig().getBoolean("requireJavaPasswordEnrollment")
+                    || (session.getProfile().isOnlinemodePreferred()
+                        && isJavaPasswordEnrolled(player.getName())))) {
             com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
                 plugin.getAuthMePremiumIntegrator();
             if (integrator != null && integrator.isAuthMePremiumEnabled()) {
@@ -119,6 +125,13 @@ public class ForceLoginTask extends ForceLoginManagement<Player, CommandSender, 
                 plugin.getPlayerFloodgateState().put(player.getUniqueId(), floodgate);
             }
         }
+    }
+
+    @Override
+    protected boolean isJavaPasswordEnrolled(String username) {
+        com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
+            core.getPlugin().getAuthMePremiumIntegrator();
+        return integrator != null && integrator.hasPasswordEnrollment(username);
     }
 
     @Override

@@ -27,6 +27,7 @@ package com.github.games647.fastlogin.core.shared;
 
 import com.github.games647.fastlogin.core.hooks.AuthPlugin;
 import com.github.games647.fastlogin.core.shared.event.FastLoginAutoLoginEvent;
+import com.github.games647.fastlogin.core.shared.FloodgateState;
 import com.github.games647.fastlogin.core.storage.SQLStorage;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
 
@@ -91,55 +92,57 @@ public abstract class ForceLoginManagement<P extends C, C, L extends LoginSessio
                         });
                     }
                 } else {
-                    boolean success = true;
                     String playerName = getName(player);
-                    if ((boolean) core.getConfig().get("autoLogin")) {
-                        if (session.needsRegistration()
-                                || ((boolean) core.getConfig().get("auto-register-unknown")
-                                && !authPlugin.isRegistered(playerName))) {
-                            success = forceRegister(player);
-                        } else if (!callFastLoginAutoLoginEvent(session, playerProfile).isCancelled()) {
-                            success = forceLogin(player);
+                    boolean javaEnrollment = (boolean) core.getConfig().get("requireJavaPasswordEnrollment")
+                        && playerProfile != null
+                        && playerProfile.getFloodgate() != FloodgateState.TRUE
+                        && playerProfile.getFloodgate() != FloodgateState.LINKED;
+                    if (javaEnrollment) {
+                        // Do not auto-register Java players with a random/empty password.
+                        // Premium cryptographic verification is NOT proof that the player
+                        // knows the existing AuthMe account password.
+                        boolean bound = playerProfile.isOnlinemodePreferred();
+                        boolean canBypass = JavaEnrollmentPolicy.canAutoLogin(
+                            bound, session.needsRegistration(), authPlugin.isRegistered(playerName),
+                            isJavaPasswordEnrolled(playerName));
+                        if (canBypass && (boolean) core.getConfig().get("autoLogin")
+                                && !callFastLoginAutoLoginEvent(session, playerProfile).isCancelled()) {
+                            forceLogin(player);
                         }
-                    }
-
-                    if (success) {
-                        //update only on success to prevent corrupt data
-                        if (playerProfile != null) {
-                            // 0.5.0/F020: persist under the name-level striped lock
-                            storage.withNameLock(getName(player), () -> {
-                                playerProfile.setId(session.getUuid());
-                                playerProfile.setOnlinemodePreferred(true);
-                                storage.save(playerProfile);
-                            });
-                        }
-
+                        // Persist Mojang UUID only, not the premium auto-login flag.
+                        // AuthMe LoginEvent/RegisterEvent promotes the profile AFTER
+                        // a successful player-supplied password or registration.
+                        storage.withNameLock(playerName, () -> {
+                            // Reload inside the name lock: the AuthMe register/login
+                            // event may have promoted premium concurrently.
+                            StoredProfile current = storage.loadProfile(playerName);
+                            if (current != null) {
+                                current.setId(session.getUuid());
+                                storage.save(current);
+                            }
+                        });
                         onForceActionSuccess(session);
                     } else {
-                        // forceLogin/forceRegister returned false but this is a verified
-                        // premium session. This happens with AuthMe 6.0: AuthMe's
-                        // AsynchronousJoin runs canBypassWithPremium() before FLP's
-                        // ForceLoginTask, so the player is already authenticated when
-                        // forceLogin() is called (returns false).
-                        // We still need to persist onlinemodePreferred=true so that future
-                        // reconnects route through requestPremiumLogin instead of
-                        // startCrackedSession (direct mode; proxy-mode backends keep
-                        // profile=null, so nothing is saved there).
-                        if (playerProfile != null) {
-                            // 0.5.0/F020: persist under the name-level striped lock
-                            storage.withNameLock(getName(player), () -> {
+                        boolean success = true;
+                        if ((boolean) core.getConfig().get("autoLogin")) {
+                            if (session.needsRegistration()
+                                    || ((boolean) core.getConfig().get("auto-register-unknown")
+                                    && !authPlugin.isRegistered(playerName))) {
+                                success = forceRegister(player);
+                            } else if (!callFastLoginAutoLoginEvent(session, playerProfile).isCancelled()) {
+                                success = forceLogin(player);
+                            }
+                        }
+                        if (success && playerProfile != null) {
+                            storage.withNameLock(playerName, () -> {
                                 playerProfile.setId(session.getUuid());
                                 playerProfile.setOnlinemodePreferred(true);
                                 storage.save(playerProfile);
                             });
-
                         }
-                        // Ack the proxy even when the auth plugin reported failure: the
-                        // session is already verified and the player is in game. Without
-                        // this ack the proxy never persists the premium row and
-                        // secondAttemptCracked can let the player join offline after a
-                        // session expiry.
-                        onForceActionSuccess(session);
+                        if (success) {
+                            onForceActionSuccess(session);
+                        }
                     }
                 }
             } else if (playerProfile != null) {
@@ -154,6 +157,11 @@ public abstract class ForceLoginManagement<P extends C, C, L extends LoginSessio
         } catch (Exception ex) {
             core.getPlugin().getLog().warn("ERROR ON FORCE LOGIN of {}", getName(player), ex);
         }
+    }
+
+    /** Check actual AuthMe password enrollment, never infer it from a premium UUID. */
+    protected boolean isJavaPasswordEnrolled(String playerName) {
+        return false;
     }
 
     public boolean forceRegister(P player) {

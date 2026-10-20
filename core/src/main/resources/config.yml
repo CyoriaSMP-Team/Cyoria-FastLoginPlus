@@ -127,6 +127,10 @@ anti-bot:
 # EFFECT  S=full   P=Paper 1.21.7+  configure-phase pre-registration; Spigot: none
 autoRegister: true
 
+
+# Cyoria opt-in: first verified Java login must register/login with a real password
+# before any future premium automatic login (never generate random credentials).
+requireJavaPasswordEnrollment: false
 # Enable auto-login for premium players
 autoLogin: true
 

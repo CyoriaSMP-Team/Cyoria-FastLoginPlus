@@ -30,6 +30,10 @@ import com.github.games647.fastlogin.bukkit.FastLoginBukkit;
 import com.github.games647.fastlogin.core.hooks.AuthPlugin;
 import fr.xephi.authme.api.v3.AuthMeApi;
 import fr.xephi.authme.events.RestoreSessionEvent;
+import fr.xephi.authme.events.LoginEvent;
+import fr.xephi.authme.events.RegisterEvent;
+import com.github.games647.fastlogin.core.storage.StoredProfile;
+import org.bukkit.Bukkit;
 import fr.xephi.authme.process.Management;
 import fr.xephi.authme.process.register.executors.ApiPasswordRegisterParams;
 import fr.xephi.authme.process.register.executors.RegistrationMethod;
@@ -77,6 +81,14 @@ public class AuthMeHook implements AuthPlugin<Player>, Listener {
 
         BukkitLoginSession session = plugin.getSession(player.spigot().getRawAddress());
         if (session != null && session.isVerifiedPremium()) {
+            if (plugin.getCore().getConfig().getBoolean("requireJavaPasswordEnrollment")
+                    && session.getProfile() != null
+                    && !session.getProfile().isOnlinemodePreferred()) {
+                // New Java binding: force the manual password/registration step.
+                // An old IP-based AuthMe session must not silently enroll it.
+                restoreSessionEvent.setCancelled(true);
+                return;
+            }
             // AuthMe 6.0 with enablePremium: let AuthMe handle premium bypass itself
             // Only cancel RestoreSession if AuthMe is NOT handling premium
             com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
@@ -99,6 +111,40 @@ public class AuthMeHook implements AuthPlugin<Player>, Listener {
         com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
             plugin.getAuthMePremiumIntegrator();
         return integrator == null || !integrator.isAuthMePremiumEnabled();
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPasswordLogin(LoginEvent event) {
+        promoteJavaEnrollment(event.getPlayer());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPasswordRegister(RegisterEvent event) {
+        promoteJavaEnrollment(event.getPlayer());
+    }
+
+    private void promoteJavaEnrollment(Player player) {
+        if (!plugin.getCore().getConfig().getBoolean("requireJavaPasswordEnrollment")) return;
+        BukkitLoginSession session = plugin.getSession(player.spigot().getRawAddress());
+        if (session == null || !session.isVerifiedPremium()
+                || session.getUuid() == null
+                || !session.getUsername().equalsIgnoreCase(player.getName())) return;
+        // Manual AuthMe event is the only path that binds a new Java identity.
+        // Load fresh by username so a previous async save cannot overwrite it.
+        final String name = player.getName();
+        final java.util.UUID verifiedUuid = session.getUuid();
+        Bukkit.getAsyncScheduler().runDelayed(plugin, task -> {
+            com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
+                plugin.getAuthMePremiumIntegrator();
+            if (integrator == null || !integrator.hasPasswordEnrollment(name)) return;
+            plugin.getCore().getStorage().withNameLock(name, () -> {
+                StoredProfile profile = plugin.getCore().getStorage().loadProfile(name);
+                if (profile == null || (profile.getId() != null && !verifiedUuid.equals(profile.getId()))) return;
+                profile.setId(verifiedUuid);
+                profile.setOnlinemodePreferred(true);
+                plugin.getCore().getStorage().save(profile);
+            });
+        }, 400L, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     @Override
