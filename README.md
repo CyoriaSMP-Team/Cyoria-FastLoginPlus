@@ -8,6 +8,10 @@ Many Minecraft servers run in "offline mode" (no Mojang authentication) to allow
 
 > Works with [ProtocolLib](https://github.com/dmulloy2/ProtocolLib). [ForDetails→](PROTOCOLLIB-ASYNC-DESIGN.md)
 
+> **CyoriaSMP edition — verified-once authentication (Folia 1.21.11).** This branch includes an opt-in Java password enrollment policy. Genuine Java players choose their own AuthMe password on the first verified login, then can auto-login on future verified connections. Floodgate-verified Bedrock players can be auto-approved. The generic FastLoginPlus behavior described elsewhere in this README is unchanged when this policy is disabled.
+>
+> **Implementation details, deployment and rollback:** [Cyoria Java Enrollment & Floodgate Auto-Approval](docs/CYORIA-JAVA-PASSWORD-ENROLLMENT.md). The candidate has passed compilation and targeted policy tests and has started on the CyoriaSMP production server; full Java/Bedrock client acceptance testing is still pending.
+
 ## Features
 
 ### Core (from FastLogin)
@@ -21,6 +25,7 @@ Many Minecraft servers run in "offline mode" (no Mojang authentication) to allow
 ### Improvements (new in FastLoginPlus)
 
 * **AuthMeReloaded 6.0 compatibility** — auto-detects AuthMeReloaded version without user config
+* **CyoriaSMP verified-once Java enrollment (opt-in)** — require a real player-chosen AuthMe password exactly once, then allow auto-login only for previously enrolled Mojang-verified Java accounts; no empty/generated password enrollment
 * **Offline Whitelist** — block unknown cracked players, allow premium via Mojang API. Replaces upstream `switchMode` which kicked new premium players
 * **Multi-layer anti-bot** — per-IP rate limiting, burst detection, temporary IP ban, trusted IP whitelist, and `FastLoginAntiBotEvent` for plugin integration
 * **[Folia](https://papermc.io/downloads/folia) support** — dedicated module with Folia-compatible scheduler
@@ -37,6 +42,34 @@ Many Minecraft servers run in "offline mode" (no Mojang authentication) to allow
 **Spigot/Paper**: drop `FastLoginPlusBukkit.jar`, an auth plugin and [ProtocolLib 5.3+](https://github.com/dmulloy2/ProtocolLib) in `plugins/` → set `online-mode=false`
 
 **Folia**: drop `FastLoginPlusFolia.jar`, an auth plugin and [ProtocolLib 5.3+](https://github.com/dmulloy2/ProtocolLib) in `plugins/` → set `online-mode=false`
+
+### CyoriaSMP: Java Register Once / Bedrock Auto Approve
+
+This is **CyoriaSMP-specific behavior**, not the default of the upstream FastLoginPlus fork. It was implemented for the Folia + AuthMe 6.0.1 + Geyser/Floodgate stack. It is enabled only when `requireJavaPasswordEnrollment: true`; other deployments keep the existing behavior by default.
+
+| Connection | First login | Next connection |
+| --- | --- | --- |
+| **Java, valid Mojang session, new account** | Complete `/register <password> <password>` using a password the player selects; do **not** create a random/empty-password AuthMe account | Auto-login once enrolled and the Mojang session is verified again |
+| **Java, valid Mojang session, existing AuthMe account** | Enter the existing AuthMe password once to bind the verified Java identity | Auto-login once linked and verified |
+| **Java, Mojang authentication not verified** | Fall back to offline/regular AuthMe password authentication; the premium bypass must not be granted (a reconnect may be required) | Still requires the password unless premium verification and enrollment both succeed |
+| **Bedrock, authenticated via Floodgate** | Auto-registration and approval, using Floodgate's verified identity | Auto-login; do not infer Bedrock authentication from username alone |
+
+**Example `plugins/FastLoginPlus/config.yml` (standalone Folia / CyoriaSMP):**
+
+```yaml
+autoRegister: true
+autoLogin: true
+requireJavaPasswordEnrollment: true
+auto-register-unknown: false
+secondAttemptCracked: true
+autoLoginFloodgate: true
+autoRegisterFloodgate: true
+allowFloodgateNameConflict: false
+```
+
+`autoRegister: true` permits the plugin to detect new genuine Java players and start Mojang verification; **it does not bypass the one-time password requirement** when `requireJavaPasswordEnrollment` is enabled. Java auto-login additionally requires a previously bound FastLogin profile and a real stored AuthMe password hash. Failed verification never proves identity. Bedrock auto-approval is limited to connections that Floodgate actually authenticates; Java/Bedrock name-conflict protections stay enabled.
+
+**Important:** The new policy is opt-in; it is not a universal configuration for other FastLoginPlus installations. Use the matching Folia build and AuthMe integration, back up AuthMe/FastLogin databases and the plugin before deploying, and test all four connection paths on your own instance. Never replace the JAR while the Minecraft process is running. See the [detailed flow, tests and rollback procedure](docs/CYORIA-JAVA-PASSWORD-ENROLLMENT.md).
 
 ### Proxy Configuration
 
@@ -131,8 +164,7 @@ Add `.other` suffix for targeting other players (default: op).
 - A bare `/flp` prints the version and usage, and requires server operator permission.
 - On Folia the permission prefix is `fastloginplus.folia.command.*` instead of `fastloginplus.bukkit.command.*`.
 
-> When a player switches from premium to cracked via `/flp cracked`, FLP will automatically purge the player’s records stored in AuthMeReloaded, ensuring the player can log in normally with their own password upon rejoining. Without this cleanup process, AuthMeReloaded will prompt the player for login credentials after they re-enter the server. However, when the player previously joined as a premium user, FLP automatically registered their account with a random password unknown to the player.  
-> For login plugins other than AuthMe, FLP does not have equivalent handling logic for the time being, requiring manual intervention.
+**Account safety when switching modes:** The original FastLoginPlus implementation can remove AuthMe records when `/flp cracked` is used. With the **Cyoria verified-once enrollment policy enabled**, the AuthMe password and account are preserved: only a stale premium authentication marker is cleared. This avoids destroying an existing player-chosen password. Treat other auth-plugin integrations separately; the Cyoria enrollment behavior is designed around AuthMe 6.0 and is not guaranteed for unrelated auth plugins.
 
 ## PlaceholderAPI
 
