@@ -236,7 +236,13 @@ public class VerifyResponseTask implements Runnable {
         // AuthMe 6.0 premium integration: inject state to skip Pre-Join dialog
         com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
             plugin.getAuthMePremiumIntegrator();
-        if (integrator != null && integrator.isAuthMePremiumEnabled()) {
+        if (integrator != null && integrator.isAuthMePremiumEnabled()
+                && (plugin.getConfig().getBoolean("autoRegister")
+                    || (plugin.getConfig().getBoolean("autoLogin")
+                        && plugin.getCore().getAuthPluginHook() != null
+                        && plugin.getCore().getAuthPluginHook().isRegistered(requestedUsername)))) {
+            // Do not mark, inject verified bypass, or pre-create unregistered
+            // players just because their Mojang session is valid.
             // Last-resort re-assert: the events that make AuthMe start its own premium listener
             // are covered by AuthMeTakeoverListener, and the reload path is prevented at the
             // source (FLP leaves AuthMe's flag at "registered"). This covers what neither can see —
