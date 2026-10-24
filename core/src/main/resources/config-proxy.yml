@@ -96,12 +96,12 @@ anti-bot:
 # Runs on the proxy: Mojang lookup, DB write and online-mode toggle happen
 # here; the backend only executes forceLogin/forceRegister through its auth
 # plugin.
-autoRegister: true
+autoRegister: false
 
 # Enable auto-login for premium players
 # The proxy decides and forwards the force-login command to the backend,
 # which executes it through the auth plugin.
-autoLogin: true
+autoLogin: false
 
 # Use premium UUID for premium players
 # The native proxy API handles the premium UUID. false = override the premium
@@ -168,7 +168,7 @@ debug: false
 # Auto-register players in flp DB but missing from auth plugin DB
 # Decided by the proxy; the backend executes the registration through the
 # auth plugin.
-auto-register-unknown: true
+auto-register-unknown: false
 
 # ======[[ Mojang API retry ]]======
 # Retry count for Name→UUID lookups (findProfile). Session verification is the

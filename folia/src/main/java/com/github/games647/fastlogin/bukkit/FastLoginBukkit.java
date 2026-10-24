@@ -884,7 +884,11 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
 
         com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
             getAuthMePremiumIntegrator();
-        if (integrator != null && integrator.isAuthMePremiumEnabled()) {
+        if (integrator != null && integrator.isAuthMePremiumEnabled()
+                && (getConfig().getBoolean("autoRegister")
+                    || (getConfig().getBoolean("autoLogin")
+                        && core.getAuthPluginHook() != null
+                        && core.getAuthPluginHook().isRegistered(playerName)))) {
             integrator.injectVerifiedUuid(playerName, premiumUuid);
             integrator.markPlayerAsPremium(playerName, premiumUuid);
             // Close both register AND login dialogs.  AuthMe may show

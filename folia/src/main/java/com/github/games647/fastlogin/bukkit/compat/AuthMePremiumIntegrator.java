@@ -240,6 +240,11 @@ public final class AuthMePremiumIntegrator {
             Method getAuth = dataSource.getClass().getMethod("getAuth", String.class);
             Object auth = getAuth.invoke(dataSource, lowerName);
             if (auth == null) {
+                // A verified Mojang account is not a registered Cyoria identity.
+                // Respect explicit manual first-time /register when autoRegister=false.
+                if (!plugin.getConfig().getBoolean("autoRegister")) {
+                    return false;
+                }
                 // First login: no AuthMe DB record yet. Pre-create one with the
                 // premium UUID so that shouldSkipPreJoinDialogForPremium() sees
                 // auth.isPremium()=true during the configuration phase (which

@@ -70,7 +70,10 @@ public class ForceLoginTask extends ForceLoginManagement<Player, CommandSender, 
         if (session != null && session.isVerifiedPremium()) {
             com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
                 plugin.getAuthMePremiumIntegrator();
-            if (integrator != null && integrator.isAuthMePremiumEnabled()) {
+            if (integrator != null && integrator.isAuthMePremiumEnabled()
+                    && plugin.getConfig().getBoolean("autoLogin")
+                    && (plugin.getCore().getAuthPluginHook() != null
+                        && plugin.getCore().getAuthPluginHook().isRegistered(player.getName()))) {
                 // the session UUID is the Mojang UUID the proxy verified
                 // and now sends along with the force message; it is null only when the proxy
                 // verified nothing. Fall back to the connection UUID otherwise. Handing null

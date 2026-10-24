@@ -93,14 +93,20 @@ public abstract class ForceLoginManagement<P extends C, C, L extends LoginSessio
                 } else {
                     boolean success = true;
                     String playerName = getName(player);
-                    if ((boolean) core.getConfig().get("autoLogin")) {
-                        if (session.needsRegistration()
-                                || ((boolean) core.getConfig().get("auto-register-unknown")
-                                && !authPlugin.isRegistered(playerName))) {
-                            success = forceRegister(player);
-                        } else if (!callFastLoginAutoLoginEvent(session, playerProfile).isCancelled()) {
-                            success = forceLogin(player);
-                        }
+                    // Auto-login must never silently call forceRegister when the
+                    // server requires a manual first-time /register (CyoriaAuth).
+                    // Verify real AuthMe registration rather than trusting the
+                    // session's registered bit: it can be based on FLP's own row.
+                    PremiumAuthPolicy.Action action = PremiumAuthPolicy.choose(
+                            (boolean) core.getConfig().get("autoLogin"),
+                            (boolean) core.getConfig().get("autoRegister"),
+                            (boolean) core.getConfig().get("auto-register-unknown"),
+                            session.needsRegistration(), authPlugin.isRegistered(playerName));
+                    if (action == PremiumAuthPolicy.Action.REGISTER) {
+                        success = forceRegister(player);
+                    } else if (action == PremiumAuthPolicy.Action.LOGIN
+                            && !callFastLoginAutoLoginEvent(session, playerProfile).isCancelled()) {
+                        success = forceLogin(player);
                     }
 
                     if (success) {

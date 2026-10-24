@@ -29,10 +29,13 @@ import com.github.games647.fastlogin.bukkit.FastLoginBukkit;
 import com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator;
 import com.github.games647.fastlogin.bukkit.event.BukkitFastLoginPremiumToggleEvent;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
+import com.github.games647.fastlogin.core.storage.SQLStorage;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
+
+import java.util.UUID;
 
 import static com.github.games647.fastlogin.core.shared.event.FastLoginPremiumToggleEvent.PremiumToggleReason;
 
@@ -69,20 +72,11 @@ public class CrackedCommand extends ToggleCommand {
         Player player = (Player) sender;
         String playerName = sender.getName();
 
-        // Always clear AuthMe locally — AuthMe is on the backend,
-        // the proxy (BungeeCord/Velocity) cannot access it.
-        // This must run even when the command is forwarded to a proxy.
-        AuthMePremiumIntegrator integrator = plugin.getAuthMePremiumIntegrator();
-        if (integrator != null) {
-            integrator.clearPlayerPremium(playerName);
-        } else {
-            plugin.getLog().warn("CrackedCommand: authMePremiumIntegrator is null, "
-                + "skipping AuthMe cleanup for {}", playerName);
-        }
-
-        // Forward to proxy if enabled; proxy handles profile persistence,
-        // messages, kick — the backend has no DB in proxy mode.
+        // Proxy mode has no local FLP database. Preserve its existing backend AuthMe
+        // cleanup, but never run that destructive action before checking a local
+        // profile and confirming a successful local FLP database write.
         if (forwardCrackedCommand(sender, playerName)) {
+            clearAuthMePremium(playerName);
             return;
         }
 
@@ -105,10 +99,12 @@ public class CrackedCommand extends ToggleCommand {
                     return;
                 }
 
-                profile.setOnlinemodePreferred(false);
-                profile.setId(null);
-
-                plugin.getCore().getStorage().save(profile);
+                if (!persistCrackedProfile(profile, plugin.getCore().getStorage())) {
+                    plugin.getScheduler().getSyncExecutor().execute(() ->
+                            plugin.getCore().sendLocaleMessage("database-error", sender));
+                    return;
+                }
+                clearAuthMePremium(playerName);
 
                 // Local path (no proxy): event + kick
                 plugin.getServer().getPluginManager().callEvent(
@@ -137,19 +133,10 @@ public class CrackedCommand extends ToggleCommand {
 
         String playerName = args[0];
 
-        // Always clear AuthMe locally — same as onCrackedSelf().
-        // AuthMe is on the backend, the proxy cannot access it.
-        AuthMePremiumIntegrator integrator = plugin.getAuthMePremiumIntegrator();
-        if (integrator != null) {
-            integrator.clearPlayerPremium(playerName);
-        } else if (plugin.getCore().isDebug()) {
-            plugin.getLog().info("CrackedCommand: authMePremiumIntegrator is null, "
-                + "skipping AuthMe cleanup for {}", playerName);
-        }
-
-        // Forward to proxy if enabled; proxy handles profile persistence,
-        // messages, kick — the backend has no DB in proxy mode.
+        // Proxy mode delegates persistence. Do not prematurely clear AuthMe for
+        // standalone requests that might be rejected by the local FLP database.
         if (forwardCrackedCommand(sender, playerName)) {
+            clearAuthMePremium(playerName);
             return;
         }
 
@@ -173,13 +160,14 @@ public class CrackedCommand extends ToggleCommand {
                     return;
                 }
 
+                if (!persistCrackedProfile(profile, plugin.getCore().getStorage())) {
+                    plugin.getScheduler().getSyncExecutor().execute(() ->
+                            plugin.getCore().sendLocaleMessage("database-error", sender));
+                    return;
+                }
+                clearAuthMePremium(playerName);
                 plugin.getScheduler().getSyncExecutor().execute(() ->
                         plugin.getCore().sendLocaleMessage("remove-premium-other", sender));
-
-                profile.setOnlinemodePreferred(false);
-                profile.setId(null);
-
-                plugin.getCore().getStorage().save(profile);
 
                 // Local path (no proxy): event
                 plugin.getServer().getPluginManager().callEvent(
@@ -191,4 +179,33 @@ public class CrackedCommand extends ToggleCommand {
     private boolean forwardCrackedCommand(CommandSender sender, String target) {
         return forwardBungeeCommand(sender, target, false);
     }
+
+    /**
+     * Commit the FLP change before AuthMe's destructive cleanup. SQLStorage.save()
+     * swallows SQL exceptions, so call saveQuietly() and abort on failed writes.
+     * Keep the in-memory profile intact on failure as well.
+     */
+    static boolean persistCrackedProfile(StoredProfile profile, SQLStorage storage) {
+        boolean wasPremium = profile.isOnlinemodePreferred();
+        UUID previousId = profile.getId();
+        profile.setOnlinemodePreferred(false);
+        profile.setId(null);
+        if (storage.saveQuietly(profile)) {
+            return true;
+        }
+        profile.setOnlinemodePreferred(wasPremium);
+        profile.setId(previousId);
+        return false;
+    }
+
+    private void clearAuthMePremium(String playerName) {
+        AuthMePremiumIntegrator integrator = plugin.getAuthMePremiumIntegrator();
+        if (integrator != null) {
+            integrator.clearPlayerPremium(playerName);
+        } else {
+            plugin.getLog().warn("CrackedCommand: authMePremiumIntegrator is null, "
+                    + "skipping AuthMe cleanup for {}", playerName);
+        }
+    }
+
 }

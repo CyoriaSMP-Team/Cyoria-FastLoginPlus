@@ -66,13 +66,13 @@
 #
 #   --------------------------------
 #   # Behind a proxy: only Paper reads it, in the configure phase (pre-registration)
-#   autoRegister: true
+#   autoRegister: false
 #   --------------------------------
 #   Standalone: This section fully works HERE.
 #   Behind a proxy: Only on Paper; On Spigot editing this section HERE changes NOTHING--you should edit this in proxy's config.yml
 #
 #   --------------------------------
-#   autoLogin: true
+#   autoLogin: false
 #   --------------------------------
 #   No "Behind a proxy:" line: behaves identically in both modes.
 
@@ -135,11 +135,9 @@ anti-bot:
 # ========================================
 # Auto-register new premium players on first join
 # Behind a proxy: only Paper reads it, in the configure phase (pre-registration)
-autoRegister: true
-
+autoRegister: false
 # Enable auto-login for premium players
-autoLogin: true
-
+autoLogin: false
 # Use premium UUID for premium players
 # In standalone mode, true = inject the premium UUID into the offline-mode
 # server (ProtocolLib reflection)
@@ -194,7 +192,7 @@ kick-toggle: true
 debug: false
 
 # Auto-register players in flp DB but missing from auth plugin DB
-auto-register-unknown: true
+auto-register-unknown: false
 
 # Respect auth plugin per-IP registration limit
 # Bukkit/Folia only - currently honored by the AuthMe hook; other auth-plugin
