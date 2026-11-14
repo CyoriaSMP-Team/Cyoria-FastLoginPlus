@@ -1,29 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.shared;
+
+import com.github.games647.fastlogin.protocol.IdentityClaim;
 
 /**
  * Name of the custom GameProfile property the proxy uses to hand the verified Mojang UUID to
@@ -41,8 +24,8 @@ package com.github.games647.fastlogin.core.shared;
  * the proxy can inject the same property. The backend therefore reads this as "the proxy attests",
  * never "FLP attests". The capability is not new either: the configure-phase auto-register already
  * trusted the payload's connection UUID, which a holder of the forwarding secret could set to the
- * victim's Mojang UUID. That is also why the property carries no second signature scheme — one
- * would not close the pre-existing path anyway.</p>
+ * victim's Mojang UUID. Modern forwarding therefore needs no second signature. Legacy
+ * identity claims instead carry a separate HMAC keyed by the existing proxy UUID.</p>
  *
  * <p><b>Two transports, two names.</b> BungeeCord's legacy forwarding appends the login profile's
  * properties to the handshake's host field as JSON, so the same attestation can ride it — but Paper
@@ -51,6 +34,12 @@ package com.github.games647.fastlogin.core.shared;
  * running an older jar on one side) keeps working.</p>
  */
 public final class ForwardingAttributes {
+
+    /** Fabric backend identity claim, authenticated by the forwarding transport. */
+    public static final String IDENTITY = IdentityClaim.PROPERTY_NAME;
+
+    /** Legacy claim HMAC; fits Paper's 16-character property-name limit. */
+    public static final String IDENTITY_SIGNATURE = IdentityClaim.SIGNATURE_PROPERTY_NAME;
 
     /**
      * Carries the Mojang UUID the proxy verified for this connection, over Velocity's modern

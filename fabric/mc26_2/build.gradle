@@ -1,0 +1,205 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * Copyright (c) 2026 Hayston1001
+ */
+
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.17.8'
+}
+
+ext.javaFloor = 25
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(25) }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+}
+
+configurations.matching { it.name in ['compileClasspath', 'testCompileClasspath', 'testRuntimeClasspath'] }
+    .configureEach {
+        attributes.attribute(org.gradle.api.attributes.java.TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE, 25)
+    }
+
+// A partial com.mojang artifact in Maven Local otherwise wins before Mojang's
+// repository and prevents Loom's Windows native variant from resolving.
+repositories {
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'MojangLibrariesForFabric'
+                url = uri('https://libraries.minecraft.net/')
+            }
+        }
+        filter { includeModule('com.mojang', 'jtracy') }
+    }
+}
+
+dependencies {
+    minecraft 'com.mojang:minecraft:26.2'
+    implementation 'net.fabricmc:fabric-loader:0.19.3'
+    implementation 'net.fabricmc.fabric-api:fabric-api:0.152.1+26.2'
+    testRuntimeOnly libs.sqlite.driver
+}
+
+// Compile the same JDK-only sources in Fabric's namespace without embedding their jars.
+def relocatedPackages = [
+    'com.github.games647.fastlogin.protocol': 'com.github.hayston1001.fastloginplus.fabric.protocol',
+    'com.github.hayston1001.fastloginplus.shared': 'com.github.hayston1001.fastloginplus.fabric.shared'
+]
+def relocatedSourceRoots = ['protocol', 'shared'].collect { module ->
+    project(":${module}").file('src/main/java')
+}
+def relocatedSources = files(relocatedSourceRoots.collect { root ->
+    fileTree(root) { include '**/*.java' }
+})
+def generatedSources = rootProject.layout.buildDirectory.dir('generated/sources/fabric26_2Shared/java')
+def generateFabricSources = tasks.register('generateFabricSources') {
+    dependsOn project(':shared').tasks.named('verifySharedSources')
+    inputs.files(relocatedSources)
+    inputs.property('relocatedPackages', relocatedPackages)
+    outputs.dir(generatedSources)
+    doLast {
+        delete(generatedSources)
+        relocatedSourceRoots.each { root ->
+            fileTree(root) { include '**/*.java' }.each { sharedSource ->
+                def source = sharedSource.getText('UTF-8').readLines().collect { line ->
+                    def declaration = line =~ /^(\s*(?:package|import\s+static|import)\s+)([\w.]+)(.*)$/
+                    if (!declaration.matches()) return line
+                    def name = declaration.group(2)
+                    relocatedPackages.each { original, relocated ->
+                        if (name == original || name.startsWith(original + '.')) {
+                            name = relocated + name.substring(original.length())
+                        }
+                    }
+                    declaration.group(1) + name + declaration.group(3)
+                }.join('\n') + '\n'
+                relocatedPackages.keySet().each { original ->
+                    if (source.contains(original) || source.contains(original.replace('.', '/'))) {
+                        throw new GradleException("Old package reference remains in relocated source: ${sharedSource}")
+                    }
+                }
+                def packages = source =~ /(?m)^\s*package\s+([\w.]+);/
+                if (!packages.find()) {
+                    throw new GradleException("Missing package in relocated source: ${sharedSource}")
+                }
+                def targetPackage = packages.group(1)
+                if (packages.find() || !relocatedPackages.values().any {
+                    targetPackage == it || targetPackage.startsWith(it + '.')
+                }) {
+                    throw new GradleException("Unexpected package in relocated source: ${sharedSource}")
+                }
+                def target = generatedSources.get().file(
+                    targetPackage.replace('.', '/') + '/' + sharedSource.name).asFile
+                if (target.exists()) {
+                    throw new GradleException("Duplicate relocated source: ${target}")
+                }
+                target.parentFile.mkdirs()
+                target.setText(source, 'UTF-8')
+            }
+        }
+    }
+}
+sourceSets.main.java.srcDir(generatedSources)
+tasks.named('compileJava') { dependsOn generateFabricSources }
+
+tasks.named('jar') {
+    archiveBaseName = 'FastLoginPlusFabric-26.2'
+}
+
+def fabricJar = tasks.named('jar', Jar)
+def verifyFabricJar = tasks.register('verifyFabricJar') {
+    group = 'verification'
+    dependsOn fabricJar
+    inputs.file(fabricJar.flatMap { it.archiveFile })
+    doLast {
+        def jarFile = fabricJar.get().archiveFile.get().asFile
+        def checkClass = { String path, InputStream stream ->
+            byte[] classBytes = stream.readAllBytes()
+            if (classBytes.length < 8 || (classBytes[0] & 255) != 0xCA ||
+                (classBytes[1] & 255) != 0xFE || (classBytes[2] & 255) != 0xBA ||
+                (classBytes[3] & 255) != 0xBE) {
+                throw new GradleException("Invalid class in Fabric jar: ${path}")
+            }
+            int major = ((classBytes[6] & 255) << 8) | (classBytes[7] & 255)
+            if (major > 69) {
+                throw new GradleException("${path} exceeds the Java 25 class floor")
+            }
+            if (new String(classBytes, java.nio.charset.StandardCharsets.ISO_8859_1)
+                .contains('com/github/games647/fastlogin')) {
+                throw new GradleException("Old package reference remains in Fabric class: ${path}")
+            }
+        }
+        new java.util.zip.ZipFile(jarFile).withCloseable { zip ->
+            if (zip.getEntry('fastloginplus-fabric.yml') == null) {
+                throw new GradleException('Fabric jar is missing the local YAML configuration template')
+            }
+            if (zip.getEntry('messages_en.yml') == null || zip.getEntry('messages_zh.yml') == null) {
+                throw new GradleException('Fabric jar is missing a bundled YAML language file')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/shared/config/ConfigRefresher.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated configuration refresher')
+            }
+            def metadataEntry = zip.getEntry('fabric.mod.json')
+            if (metadataEntry == null) {
+                throw new GradleException('Fabric jar is missing fabric.mod.json')
+            }
+            def metadata
+            zip.getInputStream(metadataEntry).withCloseable { stream ->
+                metadata = new groovy.json.JsonSlurper().parse(stream)
+            }
+            def entrypoint = 'com.github.hayston1001.fastloginplus.fabric.FastLoginFabric'
+            if (metadata.entrypoints?.main != [entrypoint] ||
+                zip.getEntry(entrypoint.replace('.', '/') + '.class') == null) {
+                throw new GradleException('Fabric entrypoint does not match the packaged class')
+            }
+            def embeddedProtocol = zip.entries().findAll {
+                it.name.startsWith('META-INF/jars/') && it.name.endsWith('.jar')
+            }
+            if (!embeddedProtocol.isEmpty()) {
+                throw new GradleException('Fabric jar must not embed an unrelocated protocol jar')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/protocol/IdentityClaim.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated identity protocol')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/protocol/ToggleWire.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated toggle protocol')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/shared/MessageColors.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated shared utility')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/shared/config/ConfigurationFiles.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated configuration reader')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/shared/message/LanguageMessages.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated language loader')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/shared/message/LanguageFileKeys.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated language key checker')
+            }
+            if (zip.getEntry('com/github/hayston1001/fastloginplus/fabric/shared/update/VersionComparator.class') == null) {
+                throw new GradleException('Fabric jar is missing the relocated version comparator')
+            }
+            zip.entries().each { entry ->
+                if (entry.name.startsWith('com/github/games647/')) {
+                    throw new GradleException("Old package remains in Fabric jar: ${entry.name}")
+                }
+                if (!entry.name.endsWith('.class') || entry.name.endsWith('/module-info.class') ||
+                    entry.name == 'module-info.class') return
+                zip.getInputStream(entry).withCloseable { stream ->
+                    checkClass(entry.name, stream)
+                }
+            }
+        }
+    }
+}
+tasks.named('assemble') { dependsOn verifyFabricJar }
+tasks.named('check') { dependsOn verifyFabricJar }
+
+tasks.named('processResources') {
+    filesMatching('fabric.mod.json') {
+        expand(projectVersion: project.version.toString())
+    }
+}

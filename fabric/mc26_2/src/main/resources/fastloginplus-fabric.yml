@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) 2026 Hayston1001
+
+# [Fabric backend] All settings in this file are backend-local.
+# Configure network and login
+# policies on the proxy; this backend checks them against local EasyAuth accounts.
+# Restart the backend after changing this file; /flp reload is not supported.
+# EasyAuth settings are checked from its current in-memory configuration.
+#
+# Bedrock auto-login requires a signed proxy claim and an existing completed
+# EasyAuth account with matching Floodgate UUID and a non-empty credential.
+# Bedrock account creation, linked login and native Floodgate bypass are unsupported.
+
+# Player messages: en or zh. Unknown values fall back to en with a warning.
+# Customize config/fastloginplus-fabric/messages_en.yml or messages_zh.yml;
+# missing keys are added and extra keys are retained and logged.
+language: en
+
+# Enable detailed diagnostic logging.
+debug: false
+
+# Check GitHub Releases for updates in the background.
+check-update: true
+
+# Hours between update checks. Values below 1 fall back to 24.
+update-check-interval: 24
+
+# Comma-separated trusted proxy UUIDs from each proxy's proxyId.txt.
+# Required for premium binding and Bedrock claims; an empty or invalid list
+# prevents those operations. This allowlist is not a firewall.
+# YAML lists are also accepted and normalized when the file is rewritten.
+allowed-proxy-ids: ''

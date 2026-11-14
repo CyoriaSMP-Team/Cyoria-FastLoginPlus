@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 
 plugins {
@@ -30,7 +11,7 @@ plugins {
 }
 
 group = 'com.github.games647'
-version = '0.7.0'
+version = '1.0.0'
 
 def commit = providers.exec {
     commandLine 'git', 'rev-parse', '--short=7', 'HEAD'
@@ -67,7 +48,8 @@ tasks.register('checkLicenseHeaders') {
     inputs.files(licensedSources)
     doLast {
         def missing = licensedSources.files.findAll { file ->
-            !file.getText('UTF-8').take(1500).contains('SPDX-License-Identifier: MIT')
+            // git ls-files also lists deleted-but-unstaged files during development
+            file.isFile() && !file.getText('UTF-8').take(1500).contains('SPDX-License-Identifier: MIT')
         }
         if (missing) throw new GradleException('Missing MIT license header: ' +
             missing.collect { rootDir.toPath().relativize(it.toPath()) }.join(', '))
@@ -75,30 +57,40 @@ tasks.register('checkLicenseHeaders') {
 }
 tasks.named('check') { dependsOn tasks.named('checkLicenseHeaders') }
 
-tasks.register('verifyReleaseTag') {
-    group = 'verification'
-    def ref = providers.environmentVariable('GITHUB_REF').orElse('')
-    inputs.property('gitRef', ref)
-    doLast {
+// Fabric/Loom forces PREFER_PROJECT, so every project needs the same repository
+// list; settings-level repositories would be ignored in that mode.
+allprojects {
+    apply from: rootProject.file('gradle/repositories.gradle')
+}
+
+// One entry point for a release: tag guard, every module's build (tests and
+// checks) and the staged installable jars. The Fabric integration is always
+// included, so a release has five installable jars.
+tasks.register('release', Sync) {
+    group = 'distribution'
+    description = 'Build every module and stage the installable jars.'
+    dependsOn tasks.named('build')
+    dependsOn subprojects.collect { it.tasks.named('build') }
+
+    def classicModules = ['bukkit', 'folia', 'bungee', 'velocity']
+    from(classicModules.collect { module ->
+        project(":${module}").tasks.named('shadowJar')
+    })
+    from(project(':fabric26_2').tasks.named('jar'))
+    into layout.buildDirectory.dir('release')
+
+    doFirst {
+        def ref = providers.environmentVariable('GITHUB_REF').orElse('')
         if (ref.get().startsWith('refs/tags/v') && ref.get().substring('refs/tags/v'.length()) !=
             project.version.toString()) {
             throw new GradleException("Release tag ${ref.get()} does not match Gradle version ${project.version}")
         }
     }
-}
-
-tasks.register('stageRelease', Sync) {
-    group = 'distribution'
-    description = 'Collect the four installable plugin jars for release.'
-    dependsOn tasks.named('verifyReleaseTag')
-    from(['bukkit', 'folia', 'bungee', 'velocity'].collect { module ->
-        project(":${module}").tasks.named('shadowJar')
-    })
-    into layout.buildDirectory.dir('release')
     doLast {
         def jars = destinationDir.listFiles().findAll { it.name.endsWith('.jar') }
-        if (jars.size() != 4 || jars.any { it.name.endsWith('-plain.jar') }) {
-            throw new GradleException("Expected four installable plugin jars in ${destinationDir}")
+        def expected = classicModules.size() + 1
+        if (jars.size() != expected || jars.any { it.name.endsWith('-plain.jar') }) {
+            throw new GradleException("Expected ${expected} installable jars in ${destinationDir}")
         }
     }
 }
@@ -274,6 +266,13 @@ subprojects {
         tasks.named('check') { dependsOn verifyPluginJar }
     }
 
+    // Loom's classpath includes Minecraft and native libraries, so the generic
+    // runtime-classpath guard cannot run for the Fabric module. That module has
+    // its own verifyFabricJar instead, and the task is not registered here.
+    if (project.name == 'fabric26_2') {
+        return
+    }
+
     // Inspect every class in a dependency that can enter a platform jar.
     // Module descriptors are exempt because their version does not set the floor.
     def checkRuntimeBytecode = tasks.register('checkRuntimeBytecode') {
@@ -315,7 +314,7 @@ gradle.projectsEvaluated {
     subprojects.each { sub ->
         if (!sub.ext.has('javaFloor')) {
             throw new GradleException("${sub.path} does not declare its Java floor: add " +
-                "`ext.javaFloor = <8|17|21>` to ${sub.name}/build.gradle")
+                "`ext.javaFloor = <8|17|21|25>` to ${sub.name}/build.gradle")
         }
     }
 }

@@ -1,0 +1,40 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * Copyright (c) 2026 Hayston1001
+ */
+
+ext.javaFloor = 8
+
+def verifySharedSources = tasks.register('verifySharedSources') {
+    group = 'verification'
+    description = 'Keep relocated shared production code JDK-only and independent of its package.'
+    def sources = fileTree('src/main/java') { include '**/*.java' }
+    inputs.files(sources)
+    doLast {
+        ['compileClasspath', 'runtimeClasspath'].each { name ->
+            if (!configurations.getByName(name).files.isEmpty()) {
+                throw new GradleException(":shared must not have production dependencies: ${name}")
+            }
+        }
+        sources.each { source ->
+            def text = source.getText('UTF-8')
+            text.readLines().each { line ->
+                def declaration = line =~ /^\s*import\s+(?:static\s+)?([^;]+);/
+                if (declaration.find() && !declaration.group(1).startsWith('java.') &&
+                    !declaration.group(1).startsWith('com.github.hayston1001.fastloginplus.shared.')) {
+                    throw new GradleException("Non-JDK/shared import in ${source}: ${line.trim()}")
+                }
+            }
+            // Do not let literals, reflective loading or package-relative resources survive relocation.
+            def literals = text.findAll(/"(?:\\.|[^"\\])*"/)
+            if (literals.any { it =~ /\b(?:com|org|net|java|javax)[.\/]/ } ||
+                text =~ /\b(?:getResource(?:AsStream)?|forName|loadClass|getPackage(?:Name)?|getClassLoader)\s*\(/ ||
+                text.contains('java.lang.reflect')) {
+                throw new GradleException("Package-dependent source in ${source}")
+            }
+        }
+    }
+}
+tasks.named('compileJava') { dependsOn verifySharedSources }
+tasks.named('check') { dependsOn verifySharedSources }

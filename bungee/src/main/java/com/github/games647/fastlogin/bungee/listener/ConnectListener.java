@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bungee.listener;
 
@@ -39,7 +20,12 @@ import com.github.games647.fastlogin.core.hooks.bedrock.FloodgateService;
 import com.github.games647.fastlogin.core.shared.ForwardingAttributes;
 import com.github.games647.fastlogin.core.shared.LoginSession;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
+import com.github.games647.fastlogin.protocol.CrackedNoticeClaim;
+import com.github.games647.fastlogin.protocol.IdentityClaim;
+import com.github.games647.fastlogin.protocol.BedrockClaim;
+import com.github.games647.fastlogin.core.hooks.bedrock.BedrockSession;
 import com.google.common.base.Throwables;
+import net.md_5.bungee.api.ProxyServer;
 import net.md_5.bungee.api.chat.TextComponent;
 import net.md_5.bungee.api.connection.PendingConnection;
 import net.md_5.bungee.api.connection.ProxiedPlayer;
@@ -111,7 +97,7 @@ public class ConnectListener implements Listener {
                         "Rewrite field not found. Setting only legacy BungeeCord field"
                 );
             }
-        } catch (ReflectiveOperationException reflectiveOperationException) {
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError reflectiveOperationException) {
             Logger logger = LoggerFactory.getLogger(ConnectListener.class);
             logger.error(
                     "Cannot find Bungee UUID field implementation; Disabling premium UUID and skin won't work.",
@@ -145,7 +131,7 @@ public class ConnectListener implements Listener {
 
         try {
             return handlerClass.getMethod(LOGIN_PROFILE_GETTER_NAME);
-        } catch (NoSuchMethodException noSuchMethodEx) {
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError noSuchMethodEx) {
             LoggerFactory.getLogger(ConnectListener.class).error(
                     "Cannot find {}.{}(); forwardSkin and the premium UUID attestation are"
                     + " disabled on this proxy build.",
@@ -156,10 +142,12 @@ public class ConnectListener implements Listener {
 
     private final FastLoginBungee plugin;
     private final AntiBotService antiBotService;
+    private final EarlyDeclarationSupport earlyDeclarations;
 
     public ConnectListener(FastLoginBungee plugin, AntiBotService antiBotService) {
         this.plugin = plugin;
         this.antiBotService = antiBotService;
+        this.earlyDeclarations = new EarlyDeclarationSupport(HANDLER_CLASS, plugin.getLog());
     }
 
     /**
@@ -192,7 +180,9 @@ public class ConnectListener implements Listener {
         InetSocketAddress address = preLoginEvent.getConnection().getAddress();
         String username = connection.getName();
 
-        plugin.getLog().info("Incoming login request for {} from {}", username, connection.getSocketAddress());
+        if (plugin.getCore().isDebug()) {
+            plugin.getLog().info("Incoming login request for {} from {}", username, connection.getSocketAddress());
+        }
 
         Action action = antiBotService.onIncomingConnection(address, username);
         if (action != Action.Continue) {
@@ -204,9 +194,6 @@ public class ConnectListener implements Listener {
         }
 
         switch (action) {
-            case Ignore:
-                // just ignore
-                return;
             case Block:
                 String message = plugin.getCore().getMessage("kick-antibot");
                 preLoginEvent.setCancelReason(TextComponent.fromLegacyText(message));
@@ -245,6 +232,9 @@ public class ConnectListener implements Listener {
             String verifiedUsername = connection.getName();
             session.setUuid(verifiedUUID);
             session.setVerifiedUsername(verifiedUsername);
+            // this connection passed the Mojang verification: it refutes any
+            // pending same-name cracked suspicion for the name
+            plugin.getCore().resetVerificationState(verifiedUsername);
 
             StoredProfile playerProfile = session.getProfile();
             playerProfile.setId(verifiedUUID);
@@ -275,9 +265,71 @@ public class ConnectListener implements Listener {
                     // property.
                     attachPremiumAttestation(connection, verifiedUsername, verifiedUUID);
                 }
+
+                // The early channel also carries the identity facts (both proxy
+                // kinds ride the forwarded profile attributes), so a
+                // Paper/Folia backend can decide before AuthMe's dialog opens.
+                attachIdentityFacts(connection, verifiedUsername, verifiedUUID, session);
             } else {
                 plugin.getLog().warn("Unexpected connection type {} — cannot update the login"
                         + " profile for {}", connection.getClass().getName(), verifiedUsername);
+            }
+        } else {
+            LoginSession session = plugin.getSession().get(connection);
+            boolean bedrock = plugin.getFloodgateService() != null
+                    && plugin.getFloodgateService().isBedrockPlayer(connection.getUniqueId());
+            if (!bedrock && session != null
+                    && session.getIdentityDecision() == IdentityClaim.Decision.OFFLINE) {
+                session.computeFacts(plugin.getCore());
+                IdentityClaim claim = new IdentityClaim(IdentityClaim.Decision.OFFLINE, connection.getName(),
+                        connection.getUniqueId(), null, session.getFacts(), null,
+                        System.currentTimeMillis(), UUID.randomUUID());
+                // Try early, warn once on failure, keep admission and the
+                // onServerConnected late sender intact. Never reject all offline players.
+                earlyDeclarations.attach(connection, claim, ProxyServer.getInstance().getConfig().getUuid());
+                if (claim.isSameNameCracked()) {
+                    attachCrackedNotice(connection, claim);
+                }
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onBedrockLogin(LoginEvent event) {
+        if (event.isCancelled() || plugin.getFloodgateService() == null) {
+            return;
+        }
+        PendingConnection connection = event.getConnection();
+        attachBedrockClaim(connection);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void refreshBedrockClaim(net.md_5.bungee.api.event.ServerConnectEvent event) {
+        if (!event.isCancelled() && plugin.getFloodgateService() != null) {
+            attachBedrockClaim(event.getPlayer().getPendingConnection());
+        }
+    }
+
+    private void attachBedrockClaim(PendingConnection connection) {
+        org.geysermc.floodgate.api.player.FloodgatePlayer player =
+                plugin.getFloodgateService().getBedrockPlayer(connection.getUniqueId());
+        if (player == null) {
+            return;
+        }
+        BedrockSession policy = BedrockSession.fromConfig(plugin.getCore().getConfig(),
+                player.getLinkedPlayer() != null);
+        BedrockClaim claim = new BedrockClaim(connection.getName(), connection.getUniqueId(), policy.isLinked(),
+                policy.getAutoLogin(), policy.getAutoRegister(), policy.getAllowConflict(),
+                System.currentTimeMillis(), UUID.randomUUID());
+        java.util.function.Consumer<Throwable> failure = error -> plugin.getLog().warn(
+                "Could not attach proxy Bedrock facts for {} (errorType={})",
+                connection.getName(), error.getClass().getSimpleName());
+        if (LoginProfileProperties.ensureOfflineProfile(connection, connection.getName(),
+                connection.getUniqueId(), failure)) {
+            boolean attached = LoginProfileProperties.attach(loginProfile(connection), BedrockClaim.PROPERTY_NAME,
+                    claim.encode(UUID.fromString(ProxyServer.getInstance().getConfig().getUuid())), failure);
+            if (attached && plugin.getCore().isDebug()) {
+                plugin.getLog().info("Attached signed proxy Bedrock facts for {}", connection.getName());
             }
         }
     }
@@ -296,6 +348,45 @@ public class ConnectListener implements Listener {
                         username, failure.toString());
             }
         });
+    }
+
+    /**
+     * Reserves and forwards the optional one-time cracked notice for this login.
+     *
+     * <p>The notice is a notification only, so every failure here is logged and
+     * left non-fatal: authentication and admission must not depend on it. A
+     * reserved claim that never reaches the backend still falls back to proxy
+     * chat on join.</p>
+     *
+     * @param connection the login connection being established
+     * @param claim      the offline identity claim for this login
+     */
+    private void attachCrackedNotice(PendingConnection connection, IdentityClaim claim) {
+        CrackedNoticeClaim notice;
+        try {
+            notice = plugin.getCrackedNoticeDelivery().prepare(
+                    connection, claim.getPlayerName(), claim.getForwardedUuid());
+        } catch (RuntimeException unavailable) {
+            plugin.getLog().warn("Could not attach the optional cracked notice for {}", claim.getPlayerName());
+            return;
+        }
+
+        java.util.function.Consumer<Throwable> failure = error -> plugin.getLog().warn(
+                "Could not attach the optional cracked notice for {}", claim.getPlayerName());
+        if (!LoginProfileProperties.ensureOfflineProfile(connection, claim.getPlayerName(),
+                claim.getForwardedUuid(), failure)) {
+            return;
+        }
+        Object profile = loginProfile(connection);
+        if (profile == null) {
+            return;
+        }
+        if (notice == null) {
+            // Never forward a client-supplied copy of the reserved property.
+            LoginProfileProperties.remove(profile, CrackedNoticeClaim.PROPERTY_NAME, failure);
+            return;
+        }
+        LoginProfileProperties.attach(profile, CrackedNoticeClaim.PROPERTY_NAME, notice.encode(), failure);
     }
 
     /**
@@ -321,9 +412,36 @@ public class ConnectListener implements Listener {
                 failure -> plugin.getLog().warn("Could not attach the verified premium UUID for {}"
                         + " to the login profile — AuthMe's first-login dialog is not skipped"
                         + ": {}", username, failure.toString()));
-        if (attached) {
+        if (attached && plugin.getCore().isDebug()) {
             plugin.getLog().info("Attaching verified premium UUID {} to the forwarded profile",
                     premiumUuid);
+        }
+    }
+
+    /**
+     * Hands the backend the identity facts for this verified login as a login
+     * profile property (the early channel is the forwarded attributes on both
+     * proxy kinds), with an HMAC keyed by the existing proxy UUID. The key itself
+     * is not included in the forwarded claim.
+     *
+     * @param connection   the login connection being established
+     * @param username     the player name
+     * @param verifiedUUID the Mojang UUID verified for this connection
+     * @param session      the login session holding the facts
+     */
+    private void attachIdentityFacts(PendingConnection connection, String username,
+                                     UUID verifiedUUID, LoginSession session) {
+        session.computeFacts(plugin.getCore());
+        IdentityClaim claim = new IdentityClaim(verifiedUUID == null ? IdentityClaim.Decision.OFFLINE
+                : IdentityClaim.Decision.PREMIUM_VERIFIED,
+                username, connection.getUniqueId(), verifiedUUID, session.getFacts(), null,
+                System.currentTimeMillis(), UUID.randomUUID());
+        boolean attached = LoginProfileProperties.attachIdentity(loginProfile(connection), claim,
+                ProxyServer.getInstance().getConfig().getUuid(),
+                failure -> plugin.getLog().warn("Could not attach the identity facts for {}"
+                        + " to the login profile. Failure type: {}", username, failure.getClass().getSimpleName()));
+        if (attached && plugin.getCore().isDebug()) {
+            plugin.getLog().info("Attaching identity facts for {} to the forwarded profile", username);
         }
     }
 
@@ -345,8 +463,10 @@ public class ConnectListener implements Listener {
                 REWRITE_ID_SETTER.invoke(connection, offlineUUID);
             }
 
-            String format = "Overridden UUID from {} to {} (based of {}) on {}";
-            plugin.getLog().info(format, oldPremiumId, offlineUUID, username, connection);
+            if (plugin.getCore().isDebug()) {
+                String format = "Overridden UUID from {} to {} (based of {}) on {}";
+                plugin.getLog().info(format, oldPremiumId, offlineUUID, username, connection);
+            }
         } catch (Exception ex) {
             plugin.getLog().error("Failed to set offline uuid of {}", username, ex);
         } catch (Throwable throwable) {
@@ -375,9 +495,14 @@ public class ConnectListener implements Listener {
             return;
         }
 
-        // delay sending force command, because Paper will process the login event asynchronously
-        // In this case it means that the force command (plugin message) is already received and processed while
-        // player is still in the login phase and reported to be offline.
+        if (!player.getPendingConnection().isOnlineMode()
+                && session.getIdentityDecision() == IdentityClaim.Decision.OFFLINE) {
+            plugin.getScheduler().runAsync(() -> plugin.getCrackedNoticeDelivery().deliver(player, server));
+        }
+
+        // No delay here: the backend gates a message that arrives during the
+        // login phase and runs it 10 ticks after PlayerJoinEvent. Velocity adds
+        // 1 s for its own login-event timing, which BungeeCord does not need.
         Runnable loginTask = new ForceLoginTask(plugin.getCore(), player, server, session);
         plugin.getScheduler().runAsync(loginTask);
     }
@@ -385,6 +510,9 @@ public class ConnectListener implements Listener {
     @EventHandler
     public void onDisconnect(PlayerDisconnectEvent disconnectEvent) {
         ProxiedPlayer player = disconnectEvent.getPlayer();
+        // an unfinished verification is settled by the core instead of being
+        // dropped: the proxy's own rejection is only visible as this disconnect
+        plugin.getCrackedNoticeDelivery().disconnected(player);
         plugin.getSession().remove(player.getPendingConnection());
         plugin.getCore().getPendingConfirms().remove(player.getUniqueId());
     }

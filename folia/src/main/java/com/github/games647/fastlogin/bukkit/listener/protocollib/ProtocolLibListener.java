@@ -1,31 +1,13 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.listener.protocollib;
 
 import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.ProtocolLibrary;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
@@ -116,7 +98,9 @@ public class ProtocolLibListener extends PacketAdapter {
             }
         } catch (Throwable th) {
             // diagnostic only — never break registration over it
-            plugin.getLog().debug("Could not check ENCRYPTION_BEGIN packet type support", th);
+            if (plugin.getCore().isDebug()) {
+                plugin.getLog().info("Could not check ENCRYPTION_BEGIN packet type support", th);
+            }
         }
     }
 
@@ -160,12 +144,9 @@ public class ProtocolLibListener extends PacketAdapter {
                 }
 
                 switch (action) {
-                    case Ignore:
-                        // just ignore
-                        return;
                     case Block:
                         String message = plugin.getCore().getMessage("kick-antibot");
-                        sender.kickPlayer(message);
+                        refuseLogin(packetEvent, sender, message);
                         break;
                     case Continue:
                     default:
@@ -206,13 +187,40 @@ public class ProtocolLibListener extends PacketAdapter {
         return packetType;
     }
 
+    /**
+     * Refuses the connection during the login phase.
+     *
+     * <p>A plain kick at this stage only records the reason on the server: the
+     * client is dropped without it and shows a generic disconnect. The
+     * login-state DISCONNECT packet is what actually shows the configured
+     * message, so every rejection in this listener goes through
+     * {@link ProtocolLibCompat#refuseLogin}. The login packet is cancelled so
+     * the server does not open a session for a connection already being closed.</p>
+     *
+     * @param packetEvent the login packet being handled
+     * @param player      the login-phase player
+     * @param message     the localized reason shown to the client
+     */
+    private void refuseLogin(PacketEvent packetEvent, Player player, String message) {
+        AsyncMarker marker = packetEvent.getAsyncMarker();
+        if (marker == null) {
+            packetEvent.setCancelled(true);
+        } else {
+            synchronized (marker.getProcessingLock()) {
+                packetEvent.setCancelled(true);
+            }
+        }
+
+        ProtocolLibCompat.refuseLogin(plugin.getLog(), plugin.getCore().isDebug(), player, message);
+    }
+
     private void onEncryptionBegin(PacketEvent packetEvent, Player sender) {
         byte[] sharedSecret = packetEvent.getPacket().getByteArrays().read(0);
 
         BukkitLoginSession session = plugin.getSession(sender.getAddress());
         if (session == null) {
             plugin.getLog().warn("Profile {} tried to send encryption response at invalid state", sender.getAddress());
-            sender.kickPlayer(plugin.getCore().getMessage("invalid-request"));
+            refuseLogin(packetEvent, sender, plugin.getCore().getMessage("invalid-request"));
         } else {
             byte[] expectedVerifyToken = session.getVerifyToken();
             if (verifyNonce(sender, packetEvent.getPacket(), session.getClientPublicKey(), expectedVerifyToken)) {
@@ -221,7 +229,7 @@ public class ProtocolLibListener extends PacketAdapter {
                 if (!session.startVerification()) {
                     plugin.getLog().warn("Duplicate encryption response from {} — ignoring",
                             sender.getAddress());
-                    sender.kickPlayer(plugin.getCore().getMessage("invalid-request"));
+                    refuseLogin(packetEvent, sender, plugin.getCore().getMessage("invalid-request"));
                     return;
                 }
 
@@ -232,7 +240,7 @@ public class ProtocolLibListener extends PacketAdapter {
                 );
                 plugin.getScheduler().runAsync(verifyTask);
             } else {
-                sender.kickPlayer(plugin.getCore().getMessage("invalid-verify-token"));
+                refuseLogin(packetEvent, sender, plugin.getCore().getMessage("invalid-verify-token"));
             }
         }
     }
@@ -271,7 +279,14 @@ public class ProtocolLibListener extends PacketAdapter {
             }
         } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException | NoSuchPaddingException
                  | IllegalBlockSizeException | BadPaddingException signatureEx) {
-            plugin.getLog().error("Invalid signature from player {}", sender, signatureEx);
+            // A forged or corrupt response is remotely triggerable; keep the stack
+            // trace out of the error log unless debug output is enabled.
+            if (plugin.getCore().isDebug()) {
+                plugin.getLog().warn("Invalid signature from player {}", sender, signatureEx);
+            } else {
+                plugin.getLog().warn("Invalid signature from player {} ({})",
+                        sender, signatureEx.getClass().getSimpleName());
+            }
             return false;
         }
     }
@@ -306,13 +321,15 @@ public class ProtocolLibListener extends PacketAdapter {
                     && verifyPublicKey(clientKey.get(), sessionUUID.get())) {
                 // missing or incorrect
                 // expired always not allowed
-                player.kickPlayer(plugin.getCore().getMessage("invalid-public-key"));
+                refuseLogin(packetEvent, player, plugin.getCore().getMessage("invalid-public-key"));
                 plugin.getLog().warn("Invalid public key from player {}", username);
                 return;
             }
         }
 
-        plugin.getLog().trace("GameProfile {} with {} connecting", sessionKey, username);
+        if (plugin.getCore().isDebug()) {
+            plugin.getLog().info("GameProfile {} with {} connecting", sessionKey, username);
+        }
 
         packetEvent.getAsyncMarker().incrementProcessingDelay();
         Runnable nameCheckTask = new NameCheckTask(

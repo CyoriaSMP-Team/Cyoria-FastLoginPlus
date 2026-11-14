@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.shared;
 
@@ -30,8 +11,9 @@ import com.github.games647.craftapi.resolver.RateLimitException;
 import com.github.games647.fastlogin.core.hooks.AuthPlugin;
 import com.github.games647.fastlogin.core.hooks.bedrock.BedrockService;
 import com.github.games647.fastlogin.core.shared.event.FastLoginPreLoginEvent;
+import com.github.games647.fastlogin.core.storage.ProfileLookupException;
+import com.github.games647.fastlogin.core.storage.SQLStorage;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
-import net.md_5.bungee.config.Configuration;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -49,6 +31,7 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
     }
 
     public void onLogin(String username, S source) {
+        core.settlePendingVerification(username);
         //check if the player is connecting through Bedrock Edition
         if (bedrockService != null && bedrockService.isBedrockConnection(username)) {
             //perform Bedrock specific checks and skip Java checks if no longer needed
@@ -71,6 +54,10 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
             if (profile == null) {
                 return null;
             }
+            if (profile.isUuidRepairRequired()) {
+                source.kick(core.getMessage("corrupt-premium-uuid"));
+                return null;
+            }
 
             if (profile.isFloodgateMigrated()) {
                 if (profile.getFloodgate() == FloodgateState.TRUE) {
@@ -90,13 +77,50 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
             callFastLoginPreLoginEvent(username, source, profile);
 
             profile.setLastIp(ip);
-            if (profile.isExistingPlayer()) {
-                if (profile.isOnlinemodePreferred()) {
+            // reading the observation follows the configured fallback semantics:
+            // with secondAttemptCracked off a marked name is treated as if
+            // it had never been recorded, so it verifies again — and a passing
+            // verification then clears the stale mark. The read side is the
+            // authority; the startup reconciliation only keeps the database tidy.
+            boolean observedCracked = profile.isSameNameCracked() && isFallbackEnabled();
+            boolean hasRealRecord = profile.isOnlinemodePreferred() || profile.getId() != null;
+            // a row that holds nothing but a dormant observation — the mark is
+            // stored, but the fallback is off and there is neither consent nor a
+            // premium UUID — is treated as if it had never been recorded
+            boolean dormantObservationOnly = profile.isSameNameCracked() && !observedCracked && !hasRealRecord;
+            if (profile.isExistingPlayer() && !dormantObservationOnly) {
+                // routing follows the record's facts: a consented name or a
+                // name whose premium UUID observation is still intact is verified
+                // again; everything else keeps the password flow
+                boolean premiumName = profile.isOnlinemodePreferred()
+                        || (profile.getId() != null && !observedCracked);
+                if (premiumName) {
+                    // the cracked fallback only applies to names without consent: a
+                    // consented name is verified on every connection (an impostor can
+                    // never drag it into the password flow), while a name whose premium
+                    // identity is not consented can log in with its password and upgrade
+                    // afterwards
+                    if (!profile.isOnlinemodePreferred() && shouldFallBackToCracked(username)) {
+                        if (core.isDebug()) {
+                            core.getPlugin().getLog()
+                                    .info("Unverified premium attempt -> cracked {}", username);
+                        }
+                        confirmSameNameCracked(username, profile);
+                        if (isValidUsername(source, profile)) {
+                            startCrackedSession(source, profile, username);
+                        }
+                        return null;
+                    }
+
                     if (core.isDebug()) {
                         core.getPlugin().getLog()
                             .info("Requesting premium login for registered player: {}", username);
                     }
-                    requestPremiumLogin(source, profile, username, true);
+                    if (canUsePremiumAccount(username, profile.getId())) {
+                        requestPremiumLogin(source, profile, username, true);
+                    } else {
+                        source.kick("FastLoginPlus: account ownership conflict");
+                    }
                 } else {
                     if (isValidUsername(source, profile)) {
                         startCrackedSession(source, profile, username);
@@ -105,39 +129,42 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                 return null;
             }
 
-            // brand-new player: decision needs Mojang lookups, run outside the lock
+            // brand-new player, or a name whose only record is an ignored
+            // observation: both get the same decision as an unknown name
+            // (including the premium check), run outside the lock
             return profile;
         });
 
         if (newPlayerProfile != null) {
-            performNewPlayerLogin(username, source, ip, newPlayerProfile);
+            performNewPlayerLogin(username, source, newPlayerProfile);
         }
     }
 
-    private void performNewPlayerLogin(String username, S source, String ip, StoredProfile profile) {
+    private void performNewPlayerLogin(String username, S source, StoredProfile profile) {
         try {
-            if (core.hasFailedLogin(ip, username)) {
+            if (shouldFallBackToCracked(username)) {
                 if (core.isDebug()) {
-                    core.getPlugin().getLog().info("Second attempt login -> cracked {}", username);
+                    core.getPlugin().getLog().info("Unverified premium attempt -> cracked {}", username);
                 }
 
-                //first login request failed so make a cracked session
+                // the previous attempt never verified: record the persistent
+                // same-name cracked observation and open the password flow directly
+                confirmSameNameCracked(username, profile);
                 startCrackedSession(source, profile, username);
                 return;
             }
 
-            Configuration config = core.getConfig();
             Optional<Profile> premiumUUID = Optional.empty();
-            if ((boolean) config.get("nameChangeCheck") || (boolean) config.get("autoRegister")
-                    || (boolean) config.get("offline-whitelist")) {
-                int retryCount = Math.max(1,
-                        ((Number) config.get("mojang-retry-count")).intValue());
-                long retryDelay =
-                        ((Number) config.get("mojang-retry-delay")).longValue();
+            if (booleanConfig("nameChangeCheck") || booleanConfig("autoRegister")
+                    || booleanConfig("offline-whitelist")) {
+                int retryCount = Math.max(1, intConfig("mojang-retry-count"));
+                long retryDelay = longConfig("mojang-retry-delay");
 
+                boolean checkedPremium = false;
                 for (int attempt = 1; attempt <= retryCount; attempt++) {
                     try {
                         premiumUUID = core.getResolver().findProfile(username);
+                        checkedPremium = true;
                         break;
                     } catch (RateLimitException rateLimitEx) {
                         core.getPlugin().getLog().error(
@@ -175,24 +202,46 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                         break;
                     }
                 }
+
+                if (!checkedPremium) {
+                    // "could not tell": a lookup that never completed —
+                    // rate limit, network trouble or an interruption — says
+                    // nothing about the name. It must not degrade the player
+                    // into the password flow: a new premium player would then
+                    // register a password account without the premium UUID
+                    // observation, and per the routing would never verify again
+                    // (the passwordless login would be lost for good).
+                    core.getPlugin().getLog().warn(
+                            "Could not determine whether {} owns a premium account: the Mojang"
+                                    + " lookup did not complete. Refusing to guess.", username);
+                    source.kick(core.getMessage("auth-server-unreachable"));
+                    return;
+                }
             }
 
             if (!premiumUUID.isPresent()
                     || (!isNameChanged(source, username, premiumUUID.get())
-                    && !isUsernameAvailable(source, username, profile))) {
+                    && !isUsernameAvailable(source, username, profile, premiumUUID.get()))) {
                 //nothing detected the player as premium -> start a cracked session
-                if ((boolean) core.getConfig().get("offline-whitelist")) {
+                if (booleanConfig("offline-whitelist")) {
                     source.kick(core.getMessage("offline-whitelist-kick-message"));
                     return;
                 }
 
                 startCrackedSession(source, profile, username);
             }
+        } catch (ProfileLookupException ex) {
+            // "could not tell" whether the name changed: treating it as
+            // "not renamed" would store the new name as a second row for the
+            // same UUID
+            core.getPlugin().getLog().error(
+                    "Failed to check the stored profile of {}; refusing to continue", username, ex);
+            source.kick(core.getMessage("database-error"));
         } catch (Exception ex) {
             core.getPlugin().getLog().error("Failed to check premium state of {}", username, ex);
             // Fail closed: an error in the decision tree must not
             // open a registration window — kick like the whitelist miss above
-            if ((boolean) core.getConfig().get("offline-whitelist")) {
+            if (booleanConfig("offline-whitelist")) {
                 try {
                     source.kick(core.getMessage("offline-whitelist-kick-message"));
                 } catch (Exception kickEx) {
@@ -216,11 +265,20 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
         return true;
     }
 
-    private boolean isUsernameAvailable(S source, String username, StoredProfile profile) throws Exception {
+    private boolean isUsernameAvailable(S source, String username, StoredProfile profile, Profile mojang)
+            throws Exception {
         if (core.isDebug()) {
             core.getPlugin().getLog().info("GameProfile {} uses a premium username", username);
         }
-        if ((boolean) core.getConfig().get("autoRegister") && (authHook == null || !authHook.isRegistered(username))) {
+        // Fabric can use this path only after its backend has confirmed account ownership.
+        if (!canUsePremiumAccount(username, mojang.getId())) {
+            return false;
+        }
+        if (isPreRegisteredPremiumAccount(username, mojang.getId())) {
+            requestPremiumLogin(source, profile, username, true);
+            return true;
+        }
+        if (booleanConfig("autoRegister") && (authHook == null || !authHook.isRegistered(username))) {
             requestPremiumLogin(source, profile, username, false);
             return true;
         }
@@ -236,7 +294,7 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
 
     private boolean isNameChanged(S source, String username, Profile profile) {
         //user not exists in the db
-        if ((boolean) core.getConfig().get("nameChangeCheck")) {
+        if (booleanConfig("nameChangeCheck")) {
             StoredProfile storedProfile = core.getStorage().loadProfile(profile.getId());
             if (storedProfile != null) {
                 if (storedProfile.getFloodgate() == FloodgateState.TRUE) {
@@ -253,11 +311,12 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                     core.getPlugin().getLog().info("GameProfile {} changed it's username", profile);
                 }
 
-                //update the username to the new one in the database
-                storedProfile.setPlayerName(username);
-
-                requestPremiumLogin(source, storedProfile, username, false);
-                return true;
+                if (canUsePremiumAccount(username, profile.getId())) {
+                    //update the username to the new one in the database
+                    storedProfile.setPlayerName(username);
+                    requestPremiumLogin(source, storedProfile, username, false);
+                    return true;
+                }
             }
         }
 
@@ -269,4 +328,128 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
     public abstract void requestPremiumLogin(S source, StoredProfile profile, String username, boolean registered);
 
     public abstract void startCrackedSession(S source, StoredProfile profile, String username);
+
+    /**
+     * Whether the configured cracked fallback is active ({@code secondAttemptCracked}).
+     * The same switch governs reading a stored observation: with it off a recorded
+     * name is treated as never marked.
+     *
+     * @return true when the fallback and the observation semantics are enabled
+     */
+    protected boolean isFallbackEnabled() {
+        return booleanConfig("secondAttemptCracked");
+    }
+
+    /**
+     * Whether repeated unverified premium attempts for the name open the cracked
+     * fallback. Requires the {@code secondAttemptCracked} fallback to be enabled
+     * and one settled, definitive "not premium" verdict — an attempt that
+     * merely never verified counts only once the settlement judged it failed.
+     *
+     * @param username exact login name
+     * @return true when the name should skip the premium attempt
+     */
+    protected boolean shouldFallBackToCracked(String username) {
+        return isFallbackEnabled() && core.getDefiniteFailures(username) >= 1;
+    }
+
+    /**
+     * Records the same-name cracked observation on the name's row: a
+     * premium verification for this name was observed to fail and none passed
+     * since. The observation is per name and persistent, so later connections go
+     * straight to the password flow instead of failing one connection first.
+     *
+     * <p>Only the confirmation that actually flips the flag queues the one-time
+     * chat notice: a record that already exists must not nag on every join.</p>
+     *
+     * @param username exact login name
+     * @param profile the name's record (new or existing)
+     */
+    protected void confirmSameNameCracked(String username, StoredProfile profile) {
+        SQLStorage storage = core.getStorage();
+        // re-read the row under the lock and merge only the observation: the
+        // snapshot loaded before this login must not overwrite a concurrent
+        // toggle, and a record deleted in the meantime stays deleted
+        boolean[] firstConfirmation = {false};
+        StoredProfile persisted = storage.saveProfileLocked(username, profile, current -> {
+            firstConfirmation[0] = !current.isSameNameCracked();
+            current.setSameNameCracked(true);
+        });
+        // the caller keeps using its profile object; reflect the observation
+        // there even when the row was deleted, as the previous behaviour did
+        profile.setSameNameCracked(true);
+        // only queue the "recorded" notice when the observation was persisted
+        if (persisted != null && firstConfirmation[0]) {
+            core.queueSameNameCrackedNotice(username);
+        }
+    }
+
+    /**
+     * The Fabric mode keeps undecided names reserved after Mojang lookup failures.
+     *
+     * <p>Unused: an unfinished Mojang lookup is "could not tell", and the
+     * unified handling is a kick that explains why
+     * ({@code auth-server-unreachable}) — reserving the name would keep a
+     * degraded, half-known state instead. This hook has no implementer in the
+     * tree (the Fabric mod runs its own flow) and is kept only so out-of-tree
+     * subclasses keep compiling.</p>
+     *
+     * @return true when this login path enforces the reservation
+     */
+    @Deprecated
+    protected boolean shouldReserveUnknownPremiumNames() {
+        return false;
+    }
+
+    /**
+     * Checks backend ownership before requesting a premium session.
+     * @param username exact login name
+     * @param mojangUuid known Mojang UUID, or null for a stored profile without one
+     * @return true when premium login may be attempted
+     */
+    protected boolean canUsePremiumAccount(String username, java.util.UUID mojangUuid) {
+        return true;
+    }
+
+    /**
+     * Reports a backend premium account that FLP has not recorded yet.
+     * @param username exact login name
+     * @param mojangUuid Mojang UUID from name lookup
+     * @return true when the backend account is already bound to that UUID
+     */
+    protected boolean isPreRegisteredPremiumAccount(String username, java.util.UUID mojangUuid) {
+        return false;
+    }
+
+    /**
+     * Fallback for a decision without a completed Mojang lookup.
+     *
+     * <p>Unused, alongside {@link #shouldReserveUnknownPremiumNames()}:
+     * an unfinished lookup now
+     * kicks with {@code auth-server-unreachable} instead of starting any
+     * session. Kept so out-of-tree subclasses keep compiling.</p>
+     *
+     * @param source this connection
+     * @param profile the unresolved stored profile
+     * @param username the requested name
+     */
+    @Deprecated
+    protected void startUndecidedSession(S source, StoredProfile profile, String username) {
+        startCrackedSession(source, profile, username);
+    }
+
+    private boolean booleanConfig(String key) {
+        return FastLoginCore.readBoolean(core.getConfig(), core.getConfigDefaults(), key,
+                core.getPlugin().getLog());
+    }
+
+    private int intConfig(String key) {
+        return FastLoginCore.readInt(core.getConfig(), core.getConfigDefaults(), key,
+                core.getPlugin().getLog());
+    }
+
+    private long longConfig(String key) {
+        return FastLoginCore.readLong(core.getConfig(), core.getConfigDefaults(), key,
+                core.getPlugin().getLog());
+    }
 }

@@ -1,31 +1,12 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit;
 
-import com.github.games647.fastlogin.core.CommonUtil;
+import com.github.hayston1001.fastloginplus.shared.MessageColors;
 import java.util.UUID;
 import net.md_5.bungee.api.chat.BaseComponent;
 import net.md_5.bungee.api.chat.TextComponent;
@@ -67,7 +48,7 @@ class FastLoginBukkitTest {
     @Test
     void testRGB() {
         String message = "&x00002a00002b&lText";
-        String msg = CommonUtil.translateColorCodes(message);
+        String msg = MessageColors.translateColorCodes(message);
         assertEquals(msg, "§x00002a00002b§lText");
 
         @SuppressWarnings("deprecation")
@@ -150,5 +131,36 @@ class FastLoginBukkitTest {
         // still inside the window at the boundary, outside one millisecond later
         assertTrue(FastLoginBukkit.isCrackedOverrideActive(now + ttl, now, ttl));
         assertFalse(FastLoginBukkit.isCrackedOverrideActive(now + ttl + 1L, now, ttl));
+    }
+
+    @Test
+    void premiumSessionSeedingToleratesAbsentIdentityFacts() {
+        // the early channel may declare nothing (no claim, or one that did not
+        // pass validation): the granted premium login must still seed its
+        // session instead of failing on a null facts bundle
+        UUID premiumUuid = UUID.randomUUID();
+
+        BukkitLoginSession undeclared = FastLoginBukkit.newPremiumSession("TestUser", premiumUuid, null);
+        assertEquals(premiumUuid, undeclared.getUuid());
+        assertTrue(undeclared.isVerifiedPremium());
+        assertFalse(undeclared.isFactsPresent());
+
+        com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts =
+                new com.github.games647.fastlogin.protocol.IdentityClaim.Facts(
+                        true, false, com.github.games647.fastlogin.protocol.IdentityClaim.Consent.YES,
+                        true, false, false);
+        BukkitLoginSession declared = FastLoginBukkit.newPremiumSession("TestUser", premiumUuid, facts);
+        assertTrue(declared.isFactsPresent());
+        assertEquals(com.github.games647.fastlogin.protocol.IdentityClaim.Consent.YES, declared.getConsent());
+    }
+
+    @Test
+    void localAutoRegisterNeverGatesTheProxyPremiumPath() {
+        // behind a proxy the login policy arrives with
+        // the identity facts, so this server's local autoRegister copy is
+        // "ignored here" (config.yml) — only standalone deployments read it
+        assertTrue(FastLoginBukkit.runsProxyPremiumPath(true, false));
+        assertTrue(FastLoginBukkit.runsProxyPremiumPath(true, true));
+        assertFalse(FastLoginBukkit.runsProxyPremiumPath(false, true));
     }
 }

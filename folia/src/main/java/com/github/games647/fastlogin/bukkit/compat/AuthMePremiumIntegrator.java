@@ -1,31 +1,15 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.compat;
 
 import com.github.games647.fastlogin.bukkit.FastLoginBukkit;
+import com.github.games647.fastlogin.core.hooks.PreLoginAuthPlugin.Registration;
+import com.github.games647.fastlogin.core.shared.AuthMeProxyPin;
+import com.google.common.util.concurrent.Striped;
 
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -37,6 +21,8 @@ import java.io.File;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.UUID;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
@@ -80,6 +66,23 @@ public final class AuthMePremiumIntegrator {
 
     private final FastLoginBukkit plugin;
     private final AuthMeVersionDetector versionDetector;
+    enum ProxyPremiumPolicy {
+        UNKNOWN,
+        ON,
+        OFF
+    }
+
+    private ProxyPremiumPolicy proxyPremiumPolicy = ProxyPremiumPolicy.UNKNOWN;
+    private boolean premiumConsumersNeedRefresh;
+    private boolean premiumSettingNeedsSave;
+    private boolean proxyReceiverPinLogged;
+    private final AtomicBoolean policyMismatchWarned = new AtomicBoolean();
+    private final AtomicBoolean releaseUnsupportedLogged = new AtomicBoolean();
+    private final Striped<Lock> placeholderLocks = Striped.lazyWeakLock(256);
+
+    public enum ReleaseOutcome {
+        RELEASED, ALREADY_ABSENT, UUID_MISMATCH, NOT_APPLICABLE, UNSUPPORTED, FAILED
+    }
 
     // Cached reflection handles (lazy-initialized)
     private Object authMeInjector;
@@ -386,11 +389,7 @@ public final class AuthMePremiumIntegrator {
                     }
                 }
             } catch (Exception e) {
-                plugin.getLog().warn("Failed to unregister {} from AuthMe 6.0: {}",
-                    playerName, e);
-                if (plugin.getCore().isDebug()) {
-                    plugin.getLog().info("AuthMe unregister exception trace", e);
-                }
+                plugin.getLog().warn("Failed to unregister {} from AuthMe 6.0", playerName, e);
             }
 
             // b) Remove from AuthMe's in-memory player cache (synchronous)
@@ -473,6 +472,184 @@ public final class AuthMePremiumIntegrator {
             plugin.getLog().warn("Failed to unregister {} from AuthMe 5.x: {}",
                 playerName, e);
         }
+    }
+
+    /**
+     * Classifies the AuthMe account behind a name for the login-method decision:
+     * no record, a password account, or an account this plugin or AuthMe's own
+     * premium flow established as premium. A premium record counts as an upgrade
+     * consent; an empty password hash is the other half of that shape.
+     * Reflective read failures propagate so the caller can fail closed.
+     *
+     * @param playerName the player name
+     * @return the account state
+     * @throws Exception when the AuthMe account cannot be read
+     */
+    public com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState inspectAccount(String playerName)
+            throws Exception {
+        String lowerName = playerName.toLowerCase(java.util.Locale.ROOT);
+        Object ds = getDataSource();
+        if (ds == null) {
+            throw new IllegalStateException("AuthMe DataSource is unavailable");
+        }
+        Method getAuth = ds.getClass().getMethod("getAuth", String.class);
+        Object auth = getAuth.invoke(ds, lowerName);
+        if (auth == null) {
+            return com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.NONE;
+        }
+        // AuthMe 5.x has no premium flag on PlayerAuth; only 6.x exposes it.
+        boolean premium = false;
+        if (versionDetector.isAuthMe6()) {
+            Method isPremium = auth.getClass().getMethod("isPremium");
+            premium = (boolean) isPremium.invoke(auth);
+        }
+        Object password = auth.getClass().getMethod("getPassword").invoke(auth);
+        String hash = password == null ? null
+                : (String) password.getClass().getMethod("getHash").invoke(password);
+        if (premium || (hash != null && hash.isEmpty())) {
+            return com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.PREMIUM_OWNED;
+        }
+        return com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.PASSWORD_ACCOUNT;
+    }
+
+    /**
+     * Captures immutable account fields immediately after a successful pre-login registration.
+     *
+     * @param playerName the name this attempt registered
+     * @return the row fingerprint, or null when unsupported, absent or unreadable
+     */
+    public Registration captureRegistration(String playerName) {
+        if (!versionDetector.isAuthMe6() || playerName == null) {
+            return null;
+        }
+        String name = playerName.toLowerCase(java.util.Locale.ROOT);
+        synchronized (placeholderLocks.get(name)) {
+            try {
+                Object ds = getDataSource();
+                return ds == null ? null : AuthMeRegistrationCleanup.capture(ds, name);
+            } catch (Exception | LinkageError error) {
+                plugin.getLog().error("AuthMe registration snapshot failed for {} (errorType={})",
+                        name, error.getClass().getSimpleName());
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Deletes a still-matching registration on this thread and verifies removal and cache cleanup.
+     * The monitor does not turn independent cached/SQL writers into a database transaction.
+     *
+     * @param registration the fingerprint captured immediately after this attempt's successful insert
+     * @return true only after successful removal, cache cleanup and absent readback
+     */
+    public boolean deleteRegistration(Registration registration) {
+        if (!versionDetector.isAuthMe6() || registration == null) {
+            return false;
+        }
+        String name = registration.getPlayerName();
+        synchronized (placeholderLocks.get(name)) {
+            try {
+                Object ds = getDataSource();
+                Object players = getPlayerCache();
+                Object pending = getPendingPremiumCache();
+                Object verifier = getPremiumLoginVerifier();
+                return ds != null && players != null && pending != null && verifier != null
+                        && AuthMeRegistrationCleanup.delete(ds, registration, players, pending, verifier);
+            } catch (Exception | LinkageError error) {
+                plugin.getLog().error("AuthMe registration cleanup failed for {} (errorType={})",
+                        name, error.getClass().getSimpleName());
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Releases only an unusable placeholder for a connection the caller has verified.
+     * All operations stay on this thread. AuthMe's unregister API queues work and must
+     * not be used here: a queued delete would outlive the lock and could delete a new password.
+     *
+     * @param playerName the verified player's name
+     * @param verifiedUuid the connection's verified Mojang UUID, or null when unavailable
+     * @return the synchronous release result, never an optimistic queued result
+     */
+    public ReleaseOutcome releaseUnusablePlaceholder(String playerName, UUID verifiedUuid) {
+        if (verifiedUuid == null) {
+            return ReleaseOutcome.NOT_APPLICABLE;
+        }
+        if (!versionDetector.isAuthMe6()) {
+            if (releaseUnsupportedLogged.compareAndSet(false, true)) {
+                plugin.getLog().info("AuthMe placeholder release unsupported: AuthMe 6 is required");
+            }
+            return ReleaseOutcome.UNSUPPORTED;
+        }
+        String lowerName = playerName.toLowerCase(java.util.Locale.ROOT);
+        synchronized (placeholderLocks.get(lowerName)) {
+            UUID originalUuid = null;
+            ReleaseOutcome outcome;
+            try {
+                Object ds = getDataSource();
+                if (ds == null) {
+                    throw new IllegalStateException("AuthMe DataSource unavailable");
+                }
+                Method getAuth = ds.getClass().getMethod("getAuth", String.class);
+                Object auth = getAuth.invoke(ds, lowerName);
+                if (auth == null) {
+                    outcome = ReleaseOutcome.ALREADY_ABSENT;
+                } else {
+                    originalUuid = (UUID) auth.getClass().getMethod("getPremiumUuid").invoke(auth);
+                    Object password = auth.getClass().getMethod("getPassword").invoke(auth);
+                    String hash = password == null ? null
+                            : (String) password.getClass().getMethod("getHash").invoke(password);
+                    if (hash != null && !hash.isEmpty()) {
+                        outcome = ReleaseOutcome.NOT_APPLICABLE;
+                    } else if (originalUuid != null && !originalUuid.equals(verifiedUuid)) {
+                        outcome = ReleaseOutcome.UUID_MISMATCH;
+                    } else {
+                        // Resolve every handle before deleting. Missing integration must not
+                        // delete a row and only then discover that its caches cannot be cleared.
+                        Method removeAuth = ds.getClass().getMethod("removeAuth", String.class);
+                        Object pending = getPendingPremiumCache();
+                        Object verifier = getPremiumLoginVerifier();
+                        if (pending == null || verifier == null) {
+                            throw new IllegalStateException("AuthMe premium caches unavailable");
+                        }
+                        Method removePending = pending.getClass().getMethod("removePending", String.class);
+                        Field verifiedField = verifier.getClass().getDeclaredField("verified");
+                        verifiedField.setAccessible(true);
+                        java.util.Map<?, ?> verified = (java.util.Map<?, ?>) verifiedField.get(verifier);
+                        if (verified == null) {
+                            throw new IllegalStateException("AuthMe verified cache unavailable");
+                        }
+                        auditPlaceholderRelease(playerName, verifiedUuid, originalUuid, "ATTEMPT");
+                        boolean removed = (boolean) removeAuth.invoke(ds, lowerName);
+                        removePending.invoke(pending, lowerName);
+                        verified.remove(lowerName);
+                        if (getAuth.invoke(ds, lowerName) != null) {
+                            outcome = ReleaseOutcome.FAILED;
+                            plugin.getLog().error("AuthMe placeholder release readback still found a row for {}",
+                                    playerName);
+                        } else {
+                            outcome = removed ? ReleaseOutcome.RELEASED : ReleaseOutcome.ALREADY_ABSENT;
+                        }
+                    }
+                }
+            } catch (Exception | LinkageError error) {
+                outcome = error instanceof ClassNotFoundException || error instanceof NoSuchMethodException
+                        || error instanceof NoSuchFieldException || error instanceof LinkageError
+                        ? ReleaseOutcome.UNSUPPORTED : ReleaseOutcome.FAILED;
+                // Exceptions from external code can contain credentials. Log only the type.
+                plugin.getLog().error("AuthMe placeholder release failed for {} (errorType={})",
+                        playerName, error.getClass().getSimpleName());
+            }
+            auditPlaceholderRelease(playerName, verifiedUuid, originalUuid, outcome.name());
+            return outcome;
+        }
+    }
+
+    private void auditPlaceholderRelease(String playerName, UUID verifiedUuid, UUID originalUuid, String result) {
+        plugin.getLog().info("AuthMe placeholder release: name={} verifiedUuid={} originalPremiumUuid={} "
+                + "reason=auto-login policy disabled and no usable password result={}",
+                playerName, verifiedUuid, originalUuid, result);
     }
 
     /**
@@ -1147,7 +1324,121 @@ public final class AuthMePremiumIntegrator {
      *
      * @return true if the operation succeeded
      */
-    public boolean forceEnablePremium() {
+    public synchronized boolean forceEnablePremium() {
+        return setPremiumEnabled(true, false);
+    }
+
+    /**
+     * Applies an explicitly declared proxy policy through the existing Settings/consumer mechanism.
+     *
+     * @param enabled the trusted proxy's autoLogin value, never a locally inferred value
+     * @return whether settings and the required consumer refresh succeeded
+     */
+    public synchronized boolean applyProxyAutoLogin(boolean enabled) {
+        proxyPremiumPolicy = enabled ? ProxyPremiumPolicy.ON : ProxyPremiumPolicy.OFF;
+        return setPremiumEnabled(enabled, false);
+    }
+
+    /**
+     * Reapplies the last declared policy after AuthMe's reload, including cached consumers.
+     * Unknown policy is a successful no-op, not an implicit request to enable premium.
+     *
+     * @return whether synchronization succeeded
+     */
+    public synchronized boolean reassertProxyAutoLogin() {
+        return proxyPremiumPolicy == ProxyPremiumPolicy.UNKNOWN
+                || setPremiumEnabled(proxyPremiumPolicy == ProxyPremiumPolicy.ON, true);
+    }
+
+    /**
+     * Disables AuthMe's independent proxy login receiver without disabling notifications.
+     * No old secret is logged, backed up, or restored when FLP is removed.
+     *
+     * @return whether the pin succeeded or the integration is absent/disabled
+     */
+    public synchronized boolean pinProxyAutoLoginOff() {
+        if (!versionDetector.isAuthMePresent()) {
+            plugin.getLog().info("AuthMe 6 proxy receiver absent; skipping proxy auto-login pin");
+            return true;
+        }
+        if (!AuthMeProxyPin.isReviewedVersion(versionDetector.getVersion())) {
+            plugin.getLog().error("Unsupported AuthMe version; proxy auto-login disablement is NOT guaranteed. "
+                    + "Use the reviewed AuthMe 6.0.1 integration.");
+            return false;
+        }
+        try {
+            Object injector = getAuthMeInjector();
+            if (injector == null) {
+                throw new IllegalStateException("AuthMe injector unavailable");
+            }
+            boolean active = pinProxyReceiver(injector);
+            if (active && !proxyReceiverPinLogged) {
+                plugin.getLog().warn("AuthMe proxy auto-login, including cross-server SSO, is disabled; "
+                        + "password players must log in again after switching servers. "
+                        + "Hooks.bungeecord stays enabled. Restore Hooks.proxySharedSecret yourself "
+                        + "if FastLoginPlus is removed.");
+                proxyReceiverPinLogged = true;
+            }
+            return true;
+        } catch (ClassNotFoundException ex) {
+            plugin.getLog().info("AuthMe proxy receiver integration class absent; skipping pin, "
+                    + "which is NOT guaranteed on this installation");
+            return false;
+        } catch (Exception | LinkageError ex) {
+            // Exception messages and causes can contain configuration values, including secrets.
+            plugin.getLog().error("Failed to pin/read back AuthMe Hooks.proxySharedSecret as empty; "
+                    + "proxy auto-login is NOT guaranteed disabled. Check the supported AuthMe version.");
+            return false;
+        }
+    }
+
+    boolean pinProxyReceiver(Object injector) throws ReflectiveOperationException {
+        return pinProxyReceiver(injector, Class.forName(AUTHME_SETTINGS_CLASS),
+                Class.forName("fr.xephi.authme.settings.properties.HooksSettings"),
+                Class.forName("ch.jalu.configme.properties.Property"), Class.forName(BUNGEE_RECEIVER_CLASS));
+    }
+
+    // The same reflection path is exercised with stand-ins without starting AuthMe or Bukkit.
+    static boolean pinProxyReceiver(Object injector, Class<?> settingsClass, Class<?> hooksClass,
+                                    Class<?> propertyBase, Class<?> receiverClass)
+            throws ReflectiveOperationException {
+        Method singleton = injector.getClass().getMethod("getSingleton", Class.class);
+        Object settings = singleton.invoke(injector, settingsClass);
+        Object enabled = hooksClass.getField("BUNGEECORD").get(null);
+        Object secret = hooksClass.getField("PROXY_SHARED_SECRET").get(null);
+        Method get = settings.getClass().getMethod("getProperty", propertyBase);
+        if (!Boolean.TRUE.equals(get.invoke(settings, enabled))) {
+            return false;
+        }
+        // Always save and refresh: retry a previous failed save or a stale receiver as well.
+        settings.getClass().getMethod("setProperty", propertyBase, Object.class)
+                .invoke(settings, secret, "");
+        settings.getClass().getMethod("save").invoke(settings);
+        // Both PLAY and Paper CONFIGURATION perform.login paths use this receiver's HMAC check.
+        Object receiver = singleton.invoke(injector, receiverClass);
+        receiverClass.getMethod("reload", settingsClass).invoke(receiver, settings);
+        Field cachedSecret = receiverClass.getDeclaredField("proxySharedSecret");
+        cachedSecret.setAccessible(true);
+        Field cachedEnabled = receiverClass.getDeclaredField("isEnabled");
+        cachedEnabled.setAccessible(true);
+        if (!"".equals(get.invoke(settings, secret)) || !"".equals(cachedSecret.get(receiver))
+                || !Boolean.TRUE.equals(get.invoke(settings, enabled)) || !cachedEnabled.getBoolean(receiver)) {
+            throw new IllegalStateException("AuthMe proxy receiver pin readback mismatch");
+        }
+        return true;
+    }
+
+    /**
+     * Whether a trusted proxy has supplied a policy that can be reasserted.
+     *
+     * @return false while startup policy is unknown
+     */
+    public synchronized boolean hasProxyAutoLoginPolicy() {
+        return proxyPremiumPolicy != ProxyPremiumPolicy.UNKNOWN;
+    }
+
+    // Package-visible to test remembered-policy/reload requests separately from AuthMe's private DI graph.
+    boolean setPremiumEnabled(boolean enabled, boolean refreshConsumers) {
         if (!versionDetector.isAuthMe6()) {
             return false;
         }
@@ -1179,31 +1470,48 @@ public final class AuthMePremiumIntegrator {
                 Class.forName("ch.jalu.configme.properties.Property"));
             boolean currentValue = (boolean) getProperty.invoke(settings, enablePremiumProperty);
 
-            if (currentValue) {
-                // Already enabled — nothing to do
+            warnIfPolicyDisabled(currentValue, enabled);
+            if (currentValue == enabled && !refreshConsumers && !premiumConsumersNeedRefresh) {
                 return true;
             }
 
-            // 3. setProperty + save (persist to disk so /authme reload keeps it)
-            Method setProperty = settings.getClass().getMethod("setProperty",
-                Class.forName("ch.jalu.configme.properties.Property"), Object.class);
-            setProperty.invoke(settings, enablePremiumProperty, true);
-
-            Method save = settings.getClass().getMethod("save");
-            save.invoke(settings);
-
-            plugin.getLog().info(
-                "FLP has forced AuthMe's enablePremium=true (was false). "
-                + "FLP handles Mojang verification; AuthMe's premium checks are now unlocked.");
+            premiumConsumersNeedRefresh = true;
+            boolean changed = currentValue != enabled;
+            if (changed) {
+                // Persist the same setting as the startup takeover; never alter player records/lists.
+                Method setProperty = settings.getClass().getMethod("setProperty",
+                    Class.forName("ch.jalu.configme.properties.Property"), Object.class);
+                premiumSettingNeedsSave = true;
+                setProperty.invoke(settings, enablePremiumProperty, enabled);
+            }
+            if (premiumSettingNeedsSave) {
+                settings.getClass().getMethod("save").invoke(settings);
+                premiumSettingNeedsSave = false;
+            }
+            if (changed && enabled) {
+                plugin.getLog().info(
+                    "FLP has forced AuthMe's enablePremium=true (was false). "
+                    + "FLP handles Mojang verification; AuthMe's premium checks are now unlocked.");
+            }
 
             // 4. Refresh every component that caches enablePremium, so the forced value takes
             //    effect without a restart or a manual /authme reload
             reloadEnablePremiumConsumers(injector, settings);
+            premiumConsumersNeedRefresh = false;
 
             return true;
         } catch (Exception e) {
-            plugin.getLog().error("Failed to force-enable AuthMe enablePremium: {}", e);
+            plugin.getLog().error("Failed to synchronize AuthMe enablePremium={}", enabled, e);
             return false;
+        }
+    }
+
+    void warnIfPolicyDisabled(boolean wasEnabled, boolean enabled) {
+        if (proxyPremiumPolicy == ProxyPremiumPolicy.OFF && wasEnabled && !enabled
+                && policyMismatchWarned.compareAndSet(false, true)) {
+            plugin.getLog().warn("Proxy declared autoLogin=false but AuthMe enablePremium was true; "
+                    + "synchronizing AuthMe premium mode to false. "
+                    + "FLP does not edit player records or proxy premium lists.");
         }
     }
 
@@ -1350,15 +1658,13 @@ public final class AuthMePremiumIntegrator {
 
             return true;
         } catch (Exception e) {
-            if (plugin.getCore().isDebug()) {
-                plugin.getLog().info("Failed to unregister premium packet listener: {}", e);
-            }
+            plugin.getLog().warn("Failed to unregister premium packet listener: {}", e);
             return false;
         }
     }
 
     /**
-     * Performs the full AuthMe 6.0 takeover: forces enablePremium=true and
+     * Performs standalone AuthMe 6.0 takeover: forces enablePremium=true and
      * unregisters AuthMe's redundant packet listener. Called once at startup after
      * AuthMe has fully initialized; the individual halves are what later re-assertions
      * use (see {@link #unregisterPremiumPacketListener()}).
@@ -1366,12 +1672,25 @@ public final class AuthMePremiumIntegrator {
      * @return true if both operations succeeded
      */
     public boolean enforceFlpPremiumControl() {
+        return enforceFlpPremiumControl(false);
+    }
+
+    /**
+     * Takes over verification without inventing a proxy policy at startup.
+     *
+     * @param proxyMode whether the initialized backend proxy manager is enabled
+     * @return whether required startup operations succeeded
+     */
+    public synchronized boolean enforceFlpPremiumControl(boolean proxyMode) {
         if (!versionDetector.isAuthMe6()) {
             return false;
         }
-        boolean forced = forceEnablePremium();
+        if (proxyMode) {
+            proxyPremiumPolicy = ProxyPremiumPolicy.UNKNOWN;
+        }
+        boolean forced = proxyMode || forceEnablePremium();
         boolean unregistered = unregisterPremiumPacketListener();
-        if (forced && !unregistered) {
+        if (!proxyMode && forced && !unregistered) {
             // half-applied state — enablePremium was persisted but
             // AuthMe's packet listener may still be registered, which would
             // double-intercept START/ENCRYPTION_RESPONSE
@@ -1423,12 +1742,12 @@ public final class AuthMePremiumIntegrator {
             }
             if (completePreJoinDialog(dialogListener, "pendingRegisterResponses",
                     connection, playerId)) {
-                plugin.getLog().info("Closed AuthMe preJoin register dialog for {}", playerId);
+                if (plugin.getCore().isDebug()) {
+                    plugin.getLog().info("Closed AuthMe preJoin register dialog for {}", playerId);
+                }
             }
         } catch (Exception e) {
-            if (plugin.getCore().isDebug()) {
-                plugin.getLog().info("Failed to close AuthMe preJoin dialog: {}", e);
-            }
+            plugin.getLog().warn("Failed to close AuthMe preJoin dialog: {}", e);
         }
     }
 
@@ -1455,12 +1774,12 @@ public final class AuthMePremiumIntegrator {
             }
             if (completePreJoinDialog(dialogListener, "pendingLoginResponses",
                     connection, playerId)) {
-                plugin.getLog().info("Closed AuthMe preJoin login dialog for {}", playerId);
+                if (plugin.getCore().isDebug()) {
+                    plugin.getLog().info("Closed AuthMe preJoin login dialog for {}", playerId);
+                }
             }
         } catch (Exception e) {
-            if (plugin.getCore().isDebug()) {
-                plugin.getLog().info("Failed to close AuthMe preJoin dialog: {}", e);
-            }
+            plugin.getLog().warn("Failed to close AuthMe preJoin dialog: {}", e);
         }
     }
 

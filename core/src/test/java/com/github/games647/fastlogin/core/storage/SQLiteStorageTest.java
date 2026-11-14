@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.storage;
 
@@ -40,10 +21,15 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -99,6 +85,127 @@ class SQLiteStorageTest {
      *
      * @throws Exception if the SQLite driver is not on the test classpath
      */
+    @Test
+    void uuidLookupDistinguishesFailureFromUnknownUuid() {
+        UUID unknown = UUID.randomUUID();
+        assertNull(storage.loadProfile(unknown), "a UUID without a row is not a lookup failure");
+
+        UUID stored = UUID.randomUUID();
+        storage.save(new StoredProfile(stored, "Steve", true, FloodgateState.FALSE, "127.0.0.1"));
+        assertNotNull(storage.loadProfile(stored));
+
+        storage.close();
+        assertThrows(ProfileLookupException.class, () -> storage.loadProfile(unknown),
+                "a database error must not look like an unknown UUID");
+    }
+
+    @Test
+    void uuidIndexIsCreatedAndReassertedIdempotently() throws Exception {
+        assertEquals(1, countUuidIndexes());
+        storage.createTables();
+        assertEquals(1, countUuidIndexes(), "a repeated startup must not duplicate the index");
+    }
+
+    @Test
+    void acceptsNamesLongerThanSixteenCharacters() {
+        // Bedrock/Floodgate prefix names exceed the Java username limit; SQLite
+        // does not enforce the declared VARCHAR width
+        String longName = ".BedrockPlayer1234";
+        storage.save(new StoredProfile(null, longName, false, FloodgateState.FALSE, "127.0.0.1"));
+
+        StoredProfile loaded = storage.loadProfile(longName);
+        assertNotNull(loaded);
+        assertTrue(loaded.isExistingPlayer(), "the long name must be persisted");
+        assertEquals(longName, loaded.getName());
+    }
+
+    @Test
+    void saveProfileLockedFollowsARename() {
+        // a premium account renamed: the row keeps its id, so the login's own
+        // record is still there under the previous name — the write must
+        // follow it instead of being dropped as "deleted"
+        storage.save(new StoredProfile(null, "Steve", true, FloodgateState.FALSE, "1.1.1.1"));
+        StoredProfile renamed = storage.loadProfile("Steve");
+        assertNotNull(renamed);
+        renamed.setPlayerName("SteveRenamed");
+
+        StoredProfile persisted = storage.saveProfileLocked("SteveRenamed", renamed, current -> {
+            current.setSameNameCracked(false);
+            current.setLastIp("4.4.4.4");
+        });
+
+        assertNotNull(persisted);
+        assertEquals(renamed.getRowId(), persisted.getRowId(), "the renamed row must keep its id");
+        StoredProfile loaded = storage.loadProfile("SteveRenamed");
+        assertTrue(loaded.isExistingPlayer());
+        assertEquals("4.4.4.4", loaded.getLastIp());
+        assertFalse(storage.loadProfile("Steve").isExistingPlayer(),
+                "the previous name must not keep a second row");
+    }
+
+    @Test
+    void saveProfileLockedKeepsAConcurrentPremiumChange() {
+        // a login assembled before the lock must not write its stale copy over
+        // an operator toggle that landed in the meantime
+        storage.save(new StoredProfile(null, "Steve", false, FloodgateState.FALSE, "1.1.1.1"));
+        StoredProfile stale = storage.loadProfile("Steve");
+        assertNotNull(stale);
+
+        StoredProfile toggled = storage.loadProfile("Steve");
+        toggled.setOnlinemodePreferred(true);
+        storage.save(toggled);
+
+        StoredProfile persisted = storage.saveProfileLocked("Steve", stale, current -> {
+            current.setFloodgate(FloodgateState.LINKED);
+            current.setLastIp("2.2.2.2");
+        });
+
+        assertNotNull(persisted);
+        StoredProfile loaded = storage.loadProfile("Steve");
+        assertTrue(loaded.isOnlinemodePreferred(), "the operator toggle must survive");
+        assertEquals(FloodgateState.LINKED, loaded.getFloodgate());
+        assertEquals("2.2.2.2", loaded.getLastIp());
+    }
+
+    @Test
+    void saveProfileLockedDoesNotResurrectADeletedRow() {
+        storage.save(new StoredProfile(null, "Steve", false, FloodgateState.FALSE, "1.1.1.1"));
+        StoredProfile stale = storage.loadProfile("Steve");
+        assertNotNull(stale);
+
+        assertTrue(storage.deleteProfile("Steve"));
+
+        assertNull(storage.saveProfileLocked("Steve", stale,
+                current -> current.setLastIp("2.2.2.2")));
+        assertFalse(storage.loadProfile("Steve").isExistingPlayer(),
+                "a login in flight must not recreate a deleted record");
+    }
+
+    @Test
+    void saveProfileLockedInsertsANewRow() {
+        StoredProfile fresh = new StoredProfile(null, "NewBedrock", false, FloodgateState.LINKED, "1.1.1.1");
+
+        StoredProfile persisted = storage.saveProfileLocked("NewBedrock", fresh,
+                current -> current.setLastIp("3.3.3.3"));
+
+        assertNotNull(persisted);
+        StoredProfile loaded = storage.loadProfile("NewBedrock");
+        assertTrue(loaded.isExistingPlayer());
+        assertEquals(FloodgateState.LINKED, loaded.getFloodgate());
+        assertEquals("3.3.3.3", loaded.getLastIp());
+    }
+
+    private int countUuidIndexes() throws Exception {
+        String dbPath = tempDir.resolve("FastLogin.db").toString();
+        try (Connection con = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
+             Statement stmt = con.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM `sqlite_master` "
+                     + "WHERE `type`='index' AND `name`='" + SQLStorage.UUID_INDEX_NAME + "'")) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+
     @Test
     void driverUnderTestMatchesExpectedVersion() throws Exception {
         URL location = Class.forName("org.sqlite.JDBC").getProtectionDomain().getCodeSource().getLocation();
@@ -183,6 +290,9 @@ class SQLiteStorageTest {
         // Migration must be logged: start (info) and completion (info)
         verify(logger).info("Migrating premium table to case-insensitive Name collation (COLLATE NOCASE)");
         verify(logger).info("Migrated premium table to case-insensitive Name collation (COLLATE NOCASE)");
+
+        // the rebuild drops the old table with its indexes; the UUID index must be re-created
+        assertEquals(1, countUuidIndexes(), "the rebuilt table must carry the UUID index");
     }
 
     @Test
@@ -193,6 +303,91 @@ class SQLiteStorageTest {
 
         storage.save(new StoredProfile(null, "Steve", true, FloodgateState.FALSE, "127.0.0.1"));
         assertNotNull(storage.loadProfile("steve"));
+    }
+
+    @Test
+    void roundTripsSameNameCrackedObservation() {
+        StoredProfile observed = new StoredProfile(null, "Steve", false, FloodgateState.FALSE, "127.0.0.1");
+        observed.setSameNameCracked(true);
+        storage.save(observed);
+
+        StoredProfile loaded = storage.loadProfile("steve");
+        assertNotNull(loaded);
+        assertTrue(loaded.isSameNameCracked(), "the same-name cracked observation must survive the round trip");
+
+        StoredProfile plain = new StoredProfile(null, "Alex", false, FloodgateState.FALSE, "127.0.0.1");
+        storage.save(plain);
+        assertFalse(storage.loadProfile("alex").isSameNameCracked());
+    }
+
+    @Test
+    void reconciliationClearsMarksWhenTheFallbackIsDisabled() {
+        // the config can change while the server is down: startup (or a reload)
+        // with secondAttemptCracked=false must clear the marks
+        UUID premiumUuid = UUID.randomUUID();
+        StoredProfile marked = new StoredProfile(premiumUuid, "Steve", true, FloodgateState.FALSE, "1.1.1.1");
+        marked.setSameNameCracked(true);
+        storage.save(marked);
+        storage.save(new StoredProfile(null, "Alex", false, FloodgateState.FALSE, "2.2.2.2"));
+
+        com.github.games647.fastlogin.core.shared.FastLoginCore.reconcileSameNameCracked(
+                storage, false, logger);
+
+        StoredProfile reloaded = storage.loadProfile("steve");
+        assertFalse(reloaded.isSameNameCracked(), "startup with the fallback off clears the marks");
+        assertEquals(premiumUuid, reloaded.getId(), "only the observation column is touched");
+        assertTrue(reloaded.isOnlinemodePreferred(), "only the observation column is touched");
+        assertEquals("1.1.1.1", reloaded.getLastIp(), "only the observation column is touched");
+    }
+
+    @Test
+    void reconciliationKeepsMarksWhenTheFallbackIsEnabled() {
+        StoredProfile marked = new StoredProfile(null, "Steve", false, FloodgateState.FALSE, "1.1.1.1");
+        marked.setSameNameCracked(true);
+        storage.save(marked);
+
+        com.github.games647.fastlogin.core.shared.FastLoginCore.reconcileSameNameCracked(
+                storage, true, logger);
+
+        assertTrue(storage.loadProfile("steve").isSameNameCracked(),
+                "startup with the fallback enabled must not touch the marks");
+    }
+
+    @Test
+    void migratesTableWithoutSameNameCrackedColumn() throws Exception {
+        // Databases that predate the observation column get it added; their rows
+        // read as "not observed" (old-data compatibility)
+        storage.close();
+        storage = null;
+
+        String dbPath = tempDir.resolve("FastLogin.db").toString();
+        Files.deleteIfExists(Paths.get(dbPath));
+        Files.deleteIfExists(Paths.get(dbPath + "-wal"));
+        Files.deleteIfExists(Paths.get(dbPath + "-shm"));
+
+        try (Connection con = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
+             Statement stmt = con.createStatement()) {
+            stmt.execute("CREATE TABLE `premium` ("
+                    + "`UserID` INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    + "`UUID` CHAR(36), "
+                    + "`Name` VARCHAR(16) COLLATE NOCASE NOT NULL, "
+                    + "`Premium` BOOLEAN NOT NULL, "
+                    + "`LastIp` VARCHAR(255) NOT NULL, "
+                    + "`LastLogin` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                    + "`Floodgate` INTEGER(3), "
+                    + "UNIQUE (`Name`))");
+            stmt.execute("INSERT INTO `premium` (`UUID`, `Name`, `Premium`, `LastIp`, `Floodgate`) "
+                    + "VALUES (NULL, 'Steve', 1, '127.0.0.1', 0)");
+        }
+
+        storage = openStorage();
+        storage.createTables();
+
+        StoredProfile loaded = storage.loadProfile("steve");
+        assertNotNull(loaded);
+        assertTrue(loaded.isOnlinemodePreferred());
+        assertFalse(loaded.isSameNameCracked(),
+                "rows older than the column read as 'not observed'");
     }
 
     @Test

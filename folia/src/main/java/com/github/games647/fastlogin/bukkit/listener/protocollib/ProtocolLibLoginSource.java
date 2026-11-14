@@ -1,35 +1,14 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.listener.protocollib;
 
 import com.comphenix.protocol.ProtocolLibrary;
-import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.reflect.StructureModifier;
-import com.comphenix.protocol.wrappers.WrappedChatComponent;
 import com.github.games647.fastlogin.bukkit.FastLoginBukkit;
 import com.github.games647.fastlogin.bukkit.listener.protocollib.packet.ClientPublicKey;
 import com.github.games647.fastlogin.core.shared.LoginSource;
@@ -40,7 +19,6 @@ import java.security.PublicKey;
 import java.util.Arrays;
 import java.util.Random;
 
-import static com.comphenix.protocol.PacketType.Login.Server.DISCONNECT;
 import static com.comphenix.protocol.PacketType.Login.Server.ENCRYPTION_BEGIN;
 
 class ProtocolLibLoginSource implements LoginSource {
@@ -102,37 +80,9 @@ class ProtocolLibLoginSource implements LoginSource {
     @Override
     public void kick(String message) {
         kicked = true;
-
-        if (!ProtocolLibCompat.isConnectionActive(plugin.getLog(), plugin.getCore().isDebug(), player)) {
-            // The player is already gone (vanilla 'Took too long to log in', client
-            // cancel, ...) — resolving the injector would NPE and the kick itself is
-            // moot. Skip silently; the disconnect is logged by the server.
-            return;
-        }
-
-        ProtocolManager protocolManager = ProtocolLibrary.getProtocolManager();
-
-        PacketContainer kickPacket = new PacketContainer(DISCONNECT);
-        kickPacket.getChatComponents().write(0, WrappedChatComponent.fromText(message));
-
-        try {
-            //send kick packet at login state
-            //the normal event.getPlayer.kickPlayer(String) method does only work at play state
-            protocolManager.sendServerPacket(player, kickPacket);
-        } catch (Exception ex) {
-            // Narrow race: the connection can drop between the isConnectionActive() check
-            // and the send above — ProtocolLib's injector lookup returns null (NPE) or the
-            // write fails. Nothing needs closing here: the connection is already gone
-            // and the finally kickPlayer below is a harmless no-op for a player who
-            // already disconnected (unlike the early-return path above, the finally
-            // still runs on this path). NameCheckTask still cancels the START packet
-            // via isKicked().
-            plugin.getLog().info("Cannot kick {}: connection already closed ({})",
-                    player.getName(), ex.getClass().getSimpleName());
-        } finally {
-            //tell the server that we want to close the connection
-            player.kickPlayer("Disconnect");
-        }
+        // the login-phase DISCONNECT packet is the only way the client can show
+        // the reason; every refusal in this package goes through it
+        ProtocolLibCompat.refuseLogin(plugin.getLog(), plugin.getCore().isDebug(), player, message);
     }
 
     @Override

@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.hooks;
 
@@ -45,6 +26,21 @@ public interface AuthPlugin<P> {
      * @return if the operation was successful
      */
     boolean forceLogin(P player);
+
+    /**
+     * Whether the auth plugin already considers this player authenticated.
+     * <p>
+     * The backend Floodgate pre-login path can authenticate a Bedrock player
+     * before the proxy's own force message arrives. A hook that can answer lets
+     * the duplicate message be ignored instead of running a second force login.
+     * Hooks that cannot answer keep the previous behaviour.
+     *
+     * @param player the online player
+     * @return true when no further force login is needed
+     */
+    default boolean isAuthenticated(P player) {
+        return false;
+    }
 
     /**
      * Forces a register in order to protect the paid account.
@@ -102,4 +98,24 @@ public interface AuthPlugin<P> {
      * @throws Exception if an error occurred
      */
     boolean isRegistered(String playerName) throws Exception;
+
+    /**
+     * Classifies the account behind a name so the login-method decision can tell
+     * a password account from one the auth plugin itself established as premium
+     * (such a record counts as an upgrade consent).
+     * <p>
+     * Failures must propagate: the caller maps them to
+     * {@link com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState#READ_FAILURE},
+     * which fails closed to the password lock and is logged.
+     *
+     * @param playerName player name
+     * @return the account state, never null
+     * @throws Exception when the account state cannot be read
+     */
+    default com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState inspectAccount(
+            String playerName) throws Exception {
+        return isRegistered(playerName)
+                ? com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.PASSWORD_ACCOUNT
+                : com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.NONE;
+    }
 }

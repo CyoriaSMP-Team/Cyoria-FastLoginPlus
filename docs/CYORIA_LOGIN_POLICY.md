@@ -41,5 +41,10 @@ of auto-login.
 5. Bad Mojang challenge -> no auto-login, no offline fallback that steals identity.
 6. Never merge playerdata/inventory from two UUIDs without account-owner proof.
 
-The focused `PremiumAuthPolicyTest` covers registration and login flag separation.
+The upstream `LoginMethodDecider` decision table (with `LoginMethodDeciderTest`
+and proxy `PolicyIntentTest` coverage) now enforces the same rule from the
+other direction: with `autoRegisterUnknown: false` a verified premium identity
+without a local AuthMe account resolves to `GUIDE_REGISTER`, never to
+`AUTO_REGISTER_LOGIN`. Account state is read from the auth plugin itself
+(`AuthPlugin.inspectAccount`), so a session flag alone can never mint access.
 Live end-to-end tests and full Gradle integration remain required before release.

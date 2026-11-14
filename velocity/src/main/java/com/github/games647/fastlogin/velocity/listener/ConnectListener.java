@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.velocity.listener;
 
@@ -34,6 +15,10 @@ import com.github.games647.fastlogin.core.hooks.bedrock.FloodgateService;
 import com.github.games647.fastlogin.core.shared.ForwardingAttributes;
 import com.github.games647.fastlogin.core.shared.LoginSession;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
+import com.github.games647.fastlogin.protocol.IdentityClaim;
+import com.github.games647.fastlogin.protocol.CrackedNoticeClaim;
+import com.github.games647.fastlogin.protocol.BedrockClaim;
+import com.github.games647.fastlogin.core.hooks.bedrock.BedrockSession;
 import com.github.games647.fastlogin.velocity.FastLoginVelocity;
 import com.github.games647.fastlogin.velocity.VelocityLoginSession;
 import com.github.games647.fastlogin.velocity.task.AsyncPremiumCheck;
@@ -44,12 +29,14 @@ import com.google.common.collect.ListMultimap;
 import com.velocitypowered.api.event.Continuation;
 import com.velocitypowered.api.event.EventManager;
 import com.velocitypowered.api.event.EventTask;
+import com.velocitypowered.api.event.PostOrder;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.connection.PreLoginEvent.PreLoginComponentResult;
 import com.velocitypowered.api.event.player.GameProfileRequestEvent;
 import com.velocitypowered.api.event.player.ServerConnectedEvent;
+import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.plugin.PluginContainer;
 import com.velocitypowered.api.proxy.InboundConnection;
 import com.velocitypowered.api.proxy.Player;
@@ -68,6 +55,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 public class ConnectListener {
 
@@ -75,13 +63,17 @@ public class ConnectListener {
 
     private final FastLoginVelocity plugin;
     private final AntiBotService antiBotService;
+    private final EarlyDeclarationSupport earlyDeclarations;
 
     public ConnectListener(FastLoginVelocity plugin, AntiBotService antiBotService) {
         this.plugin = plugin;
         this.antiBotService = antiBotService;
+        this.earlyDeclarations = new EarlyDeclarationSupport(plugin.getLog());
     }
 
-    @Subscribe
+    // Later than the reviewed AuthMe NORMAL handler. Other plugins can still run later;
+    // this is a guarantee for the reviewed combination, not exclusive event ownership.
+    @Subscribe(order = PostOrder.LAST)
     public EventTask onPreLogin(PreLoginEvent preLoginEvent) {
         if (!preLoginEvent.getResult().isAllowed()) {
             return null;
@@ -90,13 +82,17 @@ public class ConnectListener {
         InboundConnection connection = preLoginEvent.getConnection();
         String username = preLoginEvent.getUsername();
         InetSocketAddress address = connection.getRemoteAddress();
-        plugin.getLog().info("Incoming login request for {} from {}", username, address);
+        if (plugin.getCore().isDebug()) {
+            plugin.getLog().info("Incoming login request for {} from {}", username, address);
+        }
 
         // FloodgateVelocity only sets the correct username in GetProfileRequestEvent, but we need it here too.
         if (plugin.getFloodgateService() != null) {
             String floodgateUsername = getFloodgateUsername(connection);
             if (floodgateUsername != null) {
-                plugin.getLog().info("Found player's Floodgate: {}", floodgateUsername);
+                if (plugin.getCore().isDebug()) {
+                    plugin.getLog().info("Found player's Floodgate: {}", floodgateUsername);
+                }
                 username = floodgateUsername;
             }
         }
@@ -119,6 +115,8 @@ public class ConnectListener {
                     plugin.getProxy().getEventManager().fire(antiBotEvent).whenComplete((unused, ex) -> {
                         if (ex != null) {
                             plugin.getLog().error("Error firing anti-bot event", ex);
+                            resumeOnce(continuation, resumed);
+                            return;
                         }
                         Action effective = antiBotEvent.isCancelled() ? Action.Continue : action;
                         applyDecisionSafely(preLoginEvent, connection, checkedUsername, effective,
@@ -158,11 +156,6 @@ public class ConnectListener {
                                       String username, Action action, Continuation continuation,
                                       AtomicBoolean resumed) {
         switch (action) {
-            case Ignore:
-                // FastLogin stops handling the connection — login continues as
-                // a normal cracked login without premium handling
-                resumeOnce(continuation, resumed);
-                break;
             case Block:
                 String message = plugin.getCore().getMessage("kick-antibot");
                 TextComponent messageParsed = LegacyComponentSerializer.legacyAmpersand().deserialize(message);
@@ -173,7 +166,7 @@ public class ConnectListener {
             default:
                 // third-party handler cancelled the anti-bot action — run the
                 // premium check off the event loop and resume when it completes
-                plugin.getScheduler().runAsync(() -> {
+                CompletableFuture<Void> scheduled = plugin.getScheduler().runAsync(() -> {
                     try {
                         new AsyncPremiumCheck(plugin, connection, username, preLoginEvent).run();
                     } catch (Exception runEx) {
@@ -183,6 +176,9 @@ public class ConnectListener {
                         resumeOnce(continuation, resumed);
                     }
                 });
+                // A stopped scheduler completes without running the task. Its
+                // completion must still resume the paused login.
+                scheduled.whenComplete((unused, error) -> resumeOnce(continuation, resumed));
                 break;
         }
     }
@@ -190,7 +186,8 @@ public class ConnectListener {
     /**
      * apply the decision and guarantee that the continuation is
      * resumed even when applying it throws — otherwise the login hangs until
-     * the read timeout instead of degrading to a normal login.
+     * the read timeout. Failing connections surface as an undecided or
+     * missing identity fact; the backend decides how to treat them.
      *
      * @param preLoginEvent the paused pre-login event
      * @param connection    the inbound connection
@@ -222,12 +219,15 @@ public class ConnectListener {
         }
     }
 
-    @Subscribe
+    @Subscribe(order = PostOrder.LAST)
     public void onGameProfileRequest(GameProfileRequestEvent event) {
+        LoginSession claimSession = plugin.getSession().get(event.getConnection().getRemoteAddress());
         if (event.isOnlineMode()) {
             LoginSession session = plugin.getSession().get(event.getConnection().getRemoteAddress());
             if (session == null) {
                 plugin.getLog().error("No active login session found for onlinemode player {}", event.getUsername());
+                earlyDeclarations.attempt(EarlyDeclarationSupport.FailureKind.PREMIUM_CLAIM,
+                        () -> attachIdentityClaim(event, null));
                 return;
             }
 
@@ -244,6 +244,9 @@ public class ConnectListener {
             String verifiedUsername = event.getUsername();
             session.setUuid(verifiedUUID);
             session.setVerifiedUsername(verifiedUsername);
+            // this connection passed the Mojang verification: it refutes any
+            // pending same-name cracked suspicion for the name
+            plugin.getCore().resetVerificationState(verifiedUsername);
 
             StoredProfile playerProfile = session.getProfile();
             playerProfile.setId(verifiedUUID);
@@ -262,11 +265,15 @@ public class ConnectListener {
                 // accepted and serialises as hasSignature=false.
                 event.setGameProfile(event.getGameProfile().addProperty(new GameProfile.Property(
                         ForwardingAttributes.PREMIUM_UUID, verifiedUUID.toString(), "")));
-                plugin.getLog().info("Attaching verified premium UUID {} to the forwarded profile",
-                        verifiedUUID);
+                if (plugin.getCore().isDebug()) {
+                    plugin.getLog().info("Attaching verified premium UUID {} to the forwarded profile",
+                            verifiedUUID);
+                }
                 event.setGameProfile(event.getGameProfile().withId(offlineUUID));
-                plugin.getLog().info("Overridden UUID from {} to {} (based of {}) on {}",
-                        verifiedUUID, offlineUUID, verifiedUsername, event.getConnection());
+                if (plugin.getCore().isDebug()) {
+                    plugin.getLog().info("Overridden UUID from {} to {} (based of {}) on {}",
+                            verifiedUUID, offlineUUID, verifiedUsername, event.getConnection());
+                }
             }
 
             if (!(boolean) plugin.getCore().getConfig().get("forwardSkin")) {
@@ -274,6 +281,113 @@ public class ConnectListener {
                 event.setGameProfile(event.getGameProfile().withProperties(newProp));
             }
         }
+        // Best effort: early failure is visible, but never disables the late sender.
+        earlyDeclarations.attempt(event.isOnlineMode() ? EarlyDeclarationSupport.FailureKind.PREMIUM_CLAIM
+                : EarlyDeclarationSupport.FailureKind.UNVERIFIED_DECLARATION,
+                () -> attachIdentityClaim(event, claimSession));
+        earlyDeclarations.attempt(EarlyDeclarationSupport.FailureKind.UNVERIFIED_DECLARATION,
+                () -> attachBedrockClaim(event));
+    }
+
+    void attachBedrockClaim(GameProfileRequestEvent event) {
+        GameProfile profile = event.getGameProfile();
+        List<Property> properties = new ArrayList<>(profile.getProperties());
+        boolean stripped = properties.removeIf(property -> BedrockClaim.PROPERTY_NAME.equals(property.getName()));
+        FloodgatePlayer player = null;
+        if (plugin.getFloodgateService() != null) {
+            player = getFloodgatePlayer(event.getConnection());
+            if (player == null) {
+                player = plugin.getFloodgateService().getBedrockPlayer(profile.getId());
+            }
+        }
+        if (player != null) {
+            BedrockSession policy = BedrockSession.fromConfig(plugin.getCore().getConfig(),
+                    player.getLinkedPlayer() != null);
+            BedrockClaim claim = new BedrockClaim(profile.getName(), profile.getId(), policy.isLinked(),
+                    policy.getAutoLogin(), policy.getAutoRegister(), policy.getAllowConflict(),
+                    System.currentTimeMillis(), UUID.randomUUID());
+            properties.add(new Property(BedrockClaim.PROPERTY_NAME, claim.encode(plugin.getProxyId()), ""));
+            if (plugin.getCore().isDebug()) {
+                plugin.getLog().info("Attached signed proxy Bedrock facts for {}", profile.getName());
+            }
+        }
+        if (player != null || stripped) {
+            event.setGameProfile(profile.withProperties(properties));
+        }
+    }
+
+    @Subscribe(order = PostOrder.LAST)
+    public void refreshBedrockClaim(ServerPreConnectEvent event) {
+        Player player = event.getPlayer();
+        FloodgatePlayer bedrock = plugin.getFloodgateService() == null ? null
+                : plugin.getFloodgateService().getBedrockPlayer(player.getUniqueId());
+        if (bedrock == null) {
+            return;
+        }
+        BedrockSession policy = BedrockSession.fromConfig(plugin.getCore().getConfig(),
+                bedrock.getLinkedPlayer() != null);
+        List<Property> properties = new ArrayList<>(player.getGameProfileProperties());
+        properties.removeIf(property -> BedrockClaim.PROPERTY_NAME.equals(property.getName()));
+        BedrockClaim claim = new BedrockClaim(player.getUsername(), player.getUniqueId(), policy.isLinked(),
+                policy.getAutoLogin(), policy.getAutoRegister(), policy.getAllowConflict(),
+                System.currentTimeMillis(), UUID.randomUUID());
+        properties.add(new Property(BedrockClaim.PROPERTY_NAME, claim.encode(plugin.getProxyId()), ""));
+        player.setGameProfileProperties(properties);
+    }
+
+    private void attachIdentityClaim(GameProfileRequestEvent event, LoginSession session) {
+        GameProfile profile = event.getGameProfile();
+        UUID forwardedUuid = profile.getId();
+        if (forwardedUuid == null) {
+            throw new IllegalArgumentException("Cannot attach identity claim without a forwarded UUID");
+        }
+
+        // Clear any profile property with our reserved names. Exactly one value may be
+        // forwarded; malformed or repeated values must never survive as an alternate claim.
+        List<Property> properties = new ArrayList<>(profile.getProperties().size());
+        for (Property property : profile.getProperties()) {
+            if (!ForwardingAttributes.IDENTITY.equals(property.getName())
+                    && !ForwardingAttributes.IDENTITY_SIGNATURE.equals(property.getName())
+                    && !CrackedNoticeClaim.PROPERTY_NAME.equals(property.getName())) {
+                properties.add(property);
+            }
+        }
+        IdentityClaim claim;
+        try {
+            boolean bedrock = plugin.getFloodgateService() != null
+                    && getFloodgateUsername(event.getConnection()) != null;
+            if (session != null) {
+                // observation facts + upgrade consent, computed from the record state
+                // this connection saw at login time
+                session.computeFacts(plugin.getCore());
+            }
+            claim = IdentityDecisionPolicy.decide(session, event.isOnlineMode(), bedrock,
+                    (boolean) plugin.getCore().getConfig().get("premiumUuid"),
+                    plugin.getCore().getConfig().getBoolean("autoLogin"),
+                    profile.getName(), forwardedUuid);
+        } catch (IllegalArgumentException invalidProfile) {
+            throw new IllegalArgumentException("Cannot attach identity claim for an invalid profile", invalidProfile);
+        }
+        String identityValue = claim.encode();
+        properties.add(new Property(ForwardingAttributes.IDENTITY, identityValue, ""));
+        // Legacy and BungeeGuard forwarding do not sign the profile, so the backend
+        // authenticates flp_identity with this HMAC keyed by the shared proxy id.
+        // Modern forwarding signs the whole payload and ignores the extra property.
+        properties.add(new Property(ForwardingAttributes.IDENTITY_SIGNATURE,
+                IdentityClaim.sign(identityValue, plugin.getProxyId()), ""));
+        if (claim.getDecision() == IdentityClaim.Decision.OFFLINE && claim.isSameNameCracked()) {
+            try {
+                CrackedNoticeClaim notice = plugin.getCrackedNoticeDelivery().prepare(
+                        event.getConnection(), profile.getName(), forwardedUuid);
+                if (notice != null) {
+                    properties.add(new Property(CrackedNoticeClaim.PROPERTY_NAME, notice.encode(), ""));
+                }
+            } catch (RuntimeException unavailable) {
+                // Notification failures must not interfere with the identity claim or authentication.
+                plugin.getLog().warn("Could not attach the optional cracked notice for {}", profile.getName());
+            }
+        }
+        event.setGameProfile(profile.withProperties(properties));
     }
 
     private List<GameProfile.Property> removeSkin(Collection<Property> oldProperties) {
@@ -296,7 +410,9 @@ public class ConnectListener {
         if (floodgateService != null) {
             FloodgatePlayer floodgatePlayer = floodgateService.getBedrockPlayer(player.getUniqueId());
             if (floodgatePlayer != null) {
-                plugin.getLog().info("Running floodgate handling for {}", player);
+                if (plugin.getCore().isDebug()) {
+                    plugin.getLog().info("Running floodgate handling for {}", player);
+                }
                 Runnable floodgateAuthTask = new FloodgateAuthTask(plugin.getCore(), player, floodgatePlayer, server);
                 plugin.getScheduler().runAsync(floodgateAuthTask);
                 return;
@@ -305,8 +421,13 @@ public class ConnectListener {
 
         VelocityLoginSession session = plugin.getSession().get(player.getRemoteAddress());
         if (session == null) {
-            plugin.getLog().info("No active login session found on server connect for {}", player);
+            if (plugin.getCore().isDebug()) {
+                plugin.getLog().info("No active login session found on server connect for {}", player);
+            }
             return;
+        }
+        if (!player.isOnlineMode() && session.getIdentityDecision() == IdentityClaim.Decision.OFFLINE) {
+            plugin.getScheduler().runAsync(() -> plugin.getCrackedNoticeDelivery().deliver(player, server));
         }
 
         // delay sending force command, because Paper will process the login event asynchronously
@@ -321,6 +442,9 @@ public class ConnectListener {
     @Subscribe
     public void onDisconnect(DisconnectEvent disconnectEvent) {
         Player player = disconnectEvent.getPlayer();
+        // an unfinished verification is settled by the core instead of being
+        // dropped: the proxy's own rejection is only visible as this disconnect
+        plugin.getCrackedNoticeDelivery().disconnected(player);
         plugin.getCore().getPendingConfirms().remove(player.getUniqueId());
 
         plugin.getSession().remove(player.getRemoteAddress());
@@ -333,6 +457,11 @@ public class ConnectListener {
      * @return the Floodgate username or null if not found
      */
     private String getFloodgateUsername(InboundConnection connection) {
+        FloodgatePlayer player = getFloodgatePlayer(connection);
+        return player == null ? null : player.getCorrectUsername();
+    }
+
+    private FloodgatePlayer getFloodgatePlayer(InboundConnection connection) {
         try {
             // get floodgate's event handler
             Object floodgateEventHandler = getFloodgateHandler();
@@ -353,7 +482,7 @@ public class ConnectListener {
                 return null;
             }
 
-            return floodgatePlayer.getCorrectUsername();
+            return floodgatePlayer;
         } catch (Exception ex) {
             plugin.getLog().error("Failed to fetch current floodgate username", ex);
         }

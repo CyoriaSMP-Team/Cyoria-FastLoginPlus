@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.listener.protocollib;
 
@@ -90,10 +71,22 @@ public class VerifyResponseTask implements Runnable {
 
     private final byte[] sharedSecret;
 
-    private static Method encryptMethod;
-    private static Method encryptKeyMethod;
+    // resolved once per server version and published as one immutable holder,
+    // so no thread can observe a half-initialised set of methods
+    private static volatile EncryptionMethods encryptionMethods;
 
-    private static Method cipherMethod;
+    private static final class EncryptionMethods {
+
+        private final Method keyMethod;
+        private final Method encryptionMethod;
+        private final Method cipherMethod;
+
+        private EncryptionMethods(Method keyMethod, Method encryptionMethod, Method cipherMethod) {
+            this.keyMethod = keyMethod;
+            this.encryptionMethod = encryptionMethod;
+            this.cipherMethod = cipherMethod;
+        }
+    }
 
     public VerifyResponseTask(FastLoginBukkit plugin, PacketEvent packetEvent,
                               Player player, BukkitLoginSession session,
@@ -134,6 +127,10 @@ public class VerifyResponseTask implements Runnable {
             return;
         }
 
+        if (!installEncryption(loginKey)) {
+            return;
+        }
+
         String serverId = EncryptionUtil.getServerIdHashString("", loginKey, serverKey.getPublic());
 
         String requestedUsername = session.getRequestUsername();
@@ -154,18 +151,24 @@ public class VerifyResponseTask implements Runnable {
             if (!ProtocolLibCompat.isConnectionActive(plugin.getLog(), plugin.getCore().isDebug(), player)) {
                 plugin.getLog().info("Player {} disconnected during session verification, aborting",
                         requestedUsername);
+                // "could not tell": a player who left is not a failed
+                // verification — nothing recorded, nothing kicked
+                plugin.getCore().dropPendingVerification(requestedUsername);
                 return;
             }
 
             try {
                 Optional<Verification> response = resolver.hasJoined(requestedUsername, serverId, address);
                 if (response.isPresent()) {
-                    encryptConnection(session, requestedUsername, response.get(), loginKey);
+                    completeLogin(session, requestedUsername, response.get());
                     return;
                 }
 
                 // HTTP 204 — Mojang explicitly rejected the session, no point retrying
                 //user tried to fake an authentication
+                // the definitive "not premium" verdict: the only thing
+                // that counts towards the same-name cracked observation
+                plugin.getCore().recordDefiniteFailure(requestedUsername);
                 disconnect(
                         "invalid-session",
                         "Session server rejected incoming connection for GameProfile {} ({}). Possible reasons are "
@@ -200,12 +203,18 @@ public class VerifyResponseTask implements Runnable {
                         Thread.sleep(backoff);
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
-                        disconnect("session-retry-exhausted",
+                        // "could not tell": an authentication problem, not
+                        // a failed identity — nothing recorded, tell the player so
+                        plugin.getCore().dropPendingVerification(requestedUsername);
+                        disconnect("auth-server-unreachable",
                                 "Interrupted during session server retry for {}", requestedUsername);
                         return;
                     }
                 } else {
-                    disconnect("session-retry-exhausted",
+                    // "could not tell": an authentication problem, not
+                    // a failed identity — nothing recorded, tell the player so
+                    plugin.getCore().dropPendingVerification(requestedUsername);
+                    disconnect("auth-server-unreachable",
                             "Failed to connect to session server after {} attempts for {}",
                             retryCount, requestedUsername);
                 }
@@ -213,13 +222,36 @@ public class VerifyResponseTask implements Runnable {
         }
     }
 
-    private void encryptConnection(BukkitLoginSession session, String requestedUsername,
-                                   Verification verification, SecretKey loginKey) {
+    private boolean installEncryption(SecretKey loginKey) {
+        Channel channel = ProtocolLibCompat.getChannel(plugin.getLog(), plugin.getCore().isDebug(), player);
+        if (channel == null || !channel.isActive()) {
+            plugin.getCore().dropPendingVerification(session.getRequestUsername());
+            return false;
+        }
+
+        try {
+            // ProtocolLib holds the intercepted original packet until run() cancels and signals it.
+            // Mutate the pipeline on its event loop, but wait only on this async worker. Even an
+            // interrupted worker must not send a disconnect before cipher installation finishes.
+            if (channel.eventLoop().inEventLoop()) {
+                return channel.isActive() && enableEncryption(loginKey);
+            }
+            return channel.eventLoop().submit(() -> channel.isActive() && enableEncryption(loginKey))
+                    .syncUninterruptibly().getNow();
+        } catch (Exception ex) {
+            disconnect("error-kick", "Cannot enable encryption for {}", session.getRequestUsername(), ex);
+            return false;
+        }
+    }
+
+    private void completeLogin(BukkitLoginSession session, String requestedUsername, Verification verification) {
         if (plugin.getCore().isDebug()) {
             plugin.getLog().info("Profile {} has a verified premium account", requestedUsername);
         }
         String realUsername = verification.getName();
         if (realUsername == null) {
+            // a 200 with no usable verdict: "could not tell" — nothing recorded
+            plugin.getCore().dropPendingVerification(requestedUsername);
             disconnect("invalid-session", "Username field null for {}", requestedUsername);
             return;
         }
@@ -231,16 +263,35 @@ public class VerifyResponseTask implements Runnable {
 
         session.setVerifiedUsername(realUsername);
         session.setUuid(verification.getId());
+        // The pre-login event reports the UUID the connection will actually carry: the spoofed
+        // Mojang UUID when premiumUuid is on, and the name-derived offline UUID otherwise (the
+        // one seeded when the session was created for the handshake).
+        if (plugin.getConfig().getBoolean("premiumUuid")) {
+            session.setConnectionUuid(verification.getId());
+        }
         session.setVerifiedPremium(true);
+        // this connection passed the Mojang verification: it refutes any
+        // pending same-name cracked suspicion for the name
+        plugin.getCore().resetVerificationState(realUsername);
+        // refresh the session cache: its TTL starts at the pre-login write, so
+        // a slow Mojang answer could otherwise let it expire before
+        // PlayerJoinEvent and drop the player into the password flow
+        plugin.putSession(player.getAddress(), session);
 
         // AuthMe 6.0 premium integration: inject state to skip Pre-Join dialog
         com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
             plugin.getAuthMePremiumIntegrator();
-        if (integrator != null && integrator.isAuthMePremiumEnabled()
-                && (plugin.getConfig().getBoolean("autoRegister")
+        boolean premiumBypassAllowed = false;
+        try {
+            premiumBypassAllowed = plugin.getConfig().getBoolean("autoRegister")
                     || (plugin.getConfig().getBoolean("autoLogin")
                         && plugin.getCore().getAuthPluginHook() != null
-                        && plugin.getCore().getAuthPluginHook().isRegistered(requestedUsername)))) {
+                        && plugin.getCore().getAuthPluginHook().isRegistered(requestedUsername));
+        } catch (Exception isRegisteredError) {
+            plugin.getLog().warn("Could not verify AuthMe registration for {}; keeping manual flow",
+                    requestedUsername);
+        }
+        if (integrator != null && integrator.isAuthMePremiumEnabled() && premiumBypassAllowed) {
             // Do not mark, inject verified bypass, or pre-create unregistered
             // players just because their Mojang session is valid.
             // Last-resort re-assert: the events that make AuthMe start its own premium listener
@@ -269,11 +320,8 @@ public class VerifyResponseTask implements Runnable {
             }
         }
 
-        // Schedule Netty pipeline modifications on the channel's event loop thread.
-        // This avoids a race condition where enableEncryption() modifies the pipeline from an async
-        // thread while the vanilla handler is still processing the original ENCRYPTION_BEGIN packet.
-        // All pipeline work (encryption, UUID spoof, fake START injection) runs serially on the
-        // event loop, after ProtocolLib has cancelled the original packet and released the vanilla handler.
+        // Encryption was installed before contacting Mojang. Keep the remaining pipeline work
+        // (UUID spoof and fake START injection) on the event loop without installing it again.
         Channel channel = ProtocolLibCompat.getChannel(plugin.getLog(), plugin.getCore().isDebug(), player);
         if (channel == null || !channel.isActive()) {
             disconnect("error-kick", "Channel unavailable for {}", requestedUsername);
@@ -284,12 +332,7 @@ public class VerifyResponseTask implements Runnable {
         UUID uuid = verification.getId();
         ClientPublicKey clientKey = session.getClientPublicKey();
         channel.eventLoop().execute(() -> {
-            try {
-                if (!enableEncryption(loginKey)) {
-                    return;
-                }
-            } catch (Exception ex) {
-                disconnect("error-kick", "Cannot enable encryption for {}", username, ex);
+            if (!channel.isActive()) {
                 return;
             }
 
@@ -324,46 +367,27 @@ public class VerifyResponseTask implements Runnable {
         return accessor.get(injectorContainer);
     }
 
-    private boolean enableEncryption(SecretKey loginKey) throws IllegalArgumentException {
+    boolean enableEncryption(SecretKey loginKey) throws IllegalArgumentException {
         if (plugin.getCore().isDebug()) {
             plugin.getLog().info("Enabling onlinemode encryption for {}", player.getAddress());
         }
         // Initialize method reflections
-        if (encryptKeyMethod == null || encryptMethod == null) {
-            Class<?> networkManagerClass = MinecraftReflection.getNetworkManagerClass();
-            try {
-                // Try to get the old (pre MC 1.16.4) encryption method
-                encryptKeyMethod = FuzzyReflection.fromClass(networkManagerClass)
-                        .getMethodByParameters("a", SecretKey.class);
-            } catch (IllegalArgumentException exception) {
-                // Get the new encryption method
-                encryptMethod = FuzzyReflection.fromClass(networkManagerClass)
-                        .getMethodByParameters("a", Cipher.class, Cipher.class);
-
-                Class<?> encryptionClass = MinecraftReflection.getMinecraftClass(
-                        "util." + ENCRYPTION_CLASS_NAME, ENCRYPTION_CLASS_NAME
-                );
-
-                // Get the needed Cipher helper method (used to generate ciphers from login key)
-                cipherMethod = FuzzyReflection.fromClass(encryptionClass)
-                        .getMethodByParameters("a", int.class, Key.class);
-            }
-        }
+        EncryptionMethods methods = resolveEncryptionMethods();
 
         try {
             Object networkManager = this.getNetworkManager();
 
             // If cipherMethod is null - use old encryption (pre MC 1.16.4), otherwise use the new cipher one
-            if (encryptKeyMethod != null) {
+            if (methods.keyMethod != null) {
                 // Encrypt/decrypt packet flow, this behaviour is expected by the client
-                encryptKeyMethod.invoke(networkManager, loginKey);
+                methods.keyMethod.invoke(networkManager, loginKey);
             } else {
                 // Create ciphers from login key
-                Object decryptionCipher = cipherMethod.invoke(null, Cipher.DECRYPT_MODE, loginKey);
-                Object encryptionCipher = cipherMethod.invoke(null, Cipher.ENCRYPT_MODE, loginKey);
+                Object decryptionCipher = methods.cipherMethod.invoke(null, Cipher.DECRYPT_MODE, loginKey);
+                Object encryptionCipher = methods.cipherMethod.invoke(null, Cipher.ENCRYPT_MODE, loginKey);
 
                 // Encrypt/decrypt packet flow, this behaviour is expected by the client
-                encryptMethod.invoke(networkManager, decryptionCipher, encryptionCipher);
+                methods.encryptionMethod.invoke(networkManager, decryptionCipher, encryptionCipher);
             }
         } catch (Exception ex) {
             disconnect("error-kick", "Couldn't enable encryption", ex);
@@ -373,12 +397,48 @@ public class VerifyResponseTask implements Runnable {
         return true;
     }
 
+    private static EncryptionMethods resolveEncryptionMethods() {
+        EncryptionMethods resolved = encryptionMethods;
+        if (resolved != null) {
+            return resolved;
+        }
+
+        Class<?> networkManagerClass = MinecraftReflection.getNetworkManagerClass();
+        Method keyMethod;
+        Method encryptionMethod = null;
+        Method cipherMethod = null;
+        try {
+            // Try to get the old (pre MC 1.16.4) encryption method
+            keyMethod = FuzzyReflection.fromClass(networkManagerClass)
+                    .getMethodByParameters("a", SecretKey.class);
+        } catch (IllegalArgumentException exception) {
+            keyMethod = null;
+            // Get the new encryption method
+            encryptionMethod = FuzzyReflection.fromClass(networkManagerClass)
+                    .getMethodByParameters("a", Cipher.class, Cipher.class);
+
+            Class<?> encryptionClass = MinecraftReflection.getMinecraftClass(
+                    "util." + ENCRYPTION_CLASS_NAME, ENCRYPTION_CLASS_NAME
+            );
+
+            // Get the needed Cipher helper method (used to generate ciphers from login key)
+            cipherMethod = FuzzyReflection.fromClass(encryptionClass)
+                    .getMethodByParameters("a", int.class, Key.class);
+        }
+
+        resolved = new EncryptionMethods(keyMethod, encryptionMethod, cipherMethod);
+        encryptionMethods = resolved;
+        return resolved;
+    }
+
     private void disconnect(String reasonKey, String logMessage, Object... arguments) {
         // The async verification can outlive the connection (e.g. the user cancelled the
         // login while Mojang was still answering). Don't log a scary error or kick a ghost.
         if (!ProtocolLibCompat.isConnectionActive(plugin.getLog(), plugin.getCore().isDebug(), player)) {
-            plugin.getLog().info("Skipping disconnect for {}: connection already closed",
-                    session.getRequestUsername());
+            if (plugin.getCore().isDebug()) {
+                plugin.getLog().info("Skipping disconnect for {}: connection already closed",
+                        session.getRequestUsername());
+            }
             return;
         }
 
@@ -387,7 +447,7 @@ public class VerifyResponseTask implements Runnable {
     }
 
     @SuppressWarnings("deprecation") // kickPlayer needed — login state, kick(Component) won't work
-    private void kickPlayer(String reason) {
+    void kickPlayer(String reason) {
         try {
             PacketContainer kickPacket = new PacketContainer(DISCONNECT);
             kickPacket.getChatComponents().write(0, WrappedChatComponent.fromText(reason));
@@ -400,13 +460,15 @@ public class VerifyResponseTask implements Runnable {
             // The player already disconnected while the async session verification was running
             // (e.g. the user cancelled the connection). ProtocolLib throws an NPE when resolving
             // the NetworkManager of a player whose connection is closed — nothing left to kick.
-            plugin.getLog().info("Cannot kick {}: connection already closed ({})",
-                    player.getName(), ex.getClass().getSimpleName());
+            if (plugin.getCore().isDebug()) {
+                plugin.getLog().info("Cannot kick {}: connection already closed ({})",
+                        player.getName(), ex.getClass().getSimpleName());
+            }
         }
     }
 
     //fake a new login packet in order to let the server handle all the other stuff
-    private void receiveFakeStartPacket(String username, ClientPublicKey clientKey, UUID uuid) {
+    void receiveFakeStartPacket(String username, ClientPublicKey clientKey, UUID uuid) {
         PacketContainer startPacket;
         if (new MinecraftVersion(1, 20, 2).atOrAbove()) {
             startPacket = new PacketContainer(START);

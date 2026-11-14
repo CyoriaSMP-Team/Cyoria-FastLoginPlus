@@ -1,32 +1,14 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.shared;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.Reader;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -36,18 +18,20 @@ import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import static java.util.function.Function.identity;
-import static java.util.stream.Collectors.toMap;
+import java.util.function.LongSupplier;
 
 import org.slf4j.Logger;
 
@@ -56,7 +40,6 @@ import com.github.games647.craftapi.resolver.http.RotatingProxySelector;
 import com.github.games647.fastlogin.core.CommonUtil;
 import com.github.games647.fastlogin.core.ProxyAgnosticMojangResolver;
 import com.github.games647.fastlogin.core.antibot.AntiBotService;
-import com.github.games647.fastlogin.core.antibot.AntiBotService.Action;
 import com.github.games647.fastlogin.core.antibot.IpBanManager;
 import com.github.games647.fastlogin.core.antibot.PerIpRateLimiter;
 import com.github.games647.fastlogin.core.antibot.RateLimiter;
@@ -69,6 +52,10 @@ import com.github.games647.fastlogin.core.hooks.PasswordGenerator;
 import com.github.games647.fastlogin.core.storage.MySQLStorage;
 import com.github.games647.fastlogin.core.storage.SQLStorage;
 import com.github.games647.fastlogin.core.storage.SQLiteStorage;
+import com.github.hayston1001.fastloginplus.shared.config.ConfigurationFiles;
+import com.github.hayston1001.fastloginplus.shared.config.ConfigRefresher;
+import com.github.hayston1001.fastloginplus.shared.message.LanguageFileKeys;
+import com.github.hayston1001.fastloginplus.shared.message.LanguageMessages;
 import com.google.common.base.Ticker;
 import com.zaxxer.hikari.HikariConfig;
 
@@ -85,9 +72,49 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
 
     private static final long MAX_EXPIRE_RATE = 1_000_000;
 
-    private final Map<String, String> localeMessages = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Object> pendingLogin = CommonUtil.buildCache(
-            Duration.ofMinutes(5), -1
+    /** How often the settlement sweep looks for pending verifications. */
+    private static final Duration VERIFICATION_SETTLEMENT_SWEEP = Duration.ofSeconds(5);
+
+    /** How long one session-server reachability answer is reused. */
+    static final long SESSION_PROBE_CACHE_MS = 60_000L;
+
+    static final long VERIFICATION_GRACE_MS = 30_000L;
+
+    private volatile Map<String, String> localeMessages = Collections.emptyMap();
+
+    // One pending mark per case-insensitive name. Per-key compute operations
+    // serialize settlement and success so a late success clears counted failures.
+    private final ConcurrentMap<String, PendingVerification> pendingVerifications = new ConcurrentHashMap<>();
+    private final LongSupplier verificationClock;
+
+    // Settled definitive "not premium" verdicts — the only thing
+    // that counts towards the same-name cracked observation. Bounded with a
+    // long TTL: the confirmed observation itself lives in the storage row.
+    private final ConcurrentMap<String, Integer> definiteFailures = CommonUtil.buildCache(
+            Duration.ofHours(1), 10_000
+    );
+
+    // Session-server reachability probe (see SessionServerProbe);
+    // created with the resolver in load()
+    private SessionServerProbe sessionProbe;
+
+    // The settlement sweep is a self-chaining delayed task (the same
+    // idiom as the relay retry), started with the storage and stopped at close
+    private volatile boolean settling;
+
+    // one-time chat notices owed for a freshly confirmed same-name cracked
+    // observation: queued at the first confirmation, delivered when
+    // the player actually reaches the game — a login-phase connection cannot
+    // see chat yet. The proxy's join task consumes it for proxy chat or hands
+    // it to a capable Fabric backend for backend-local rendering. Keys are
+    // names and an entry is only created
+    // when the flag flips (one per name at a time, consumed at the first
+    // completed join), so the map never expires — a player whose first attempt
+    // died before joining still gets the notice on the next one. The size cap
+    // is only a leak fuse for the theoretical flood of confirmed-but-never-
+    // joining names; it should never trigger in practice.
+    private final ConcurrentMap<String, Boolean> sameNameCrackedNotices = CommonUtil.buildCache(
+            null, 100_000
     );
 
     // concurrent set: proxy-side plugin-message listeners run on Netty
@@ -98,6 +125,16 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
     private MojangResolver resolver;
 
     private Configuration config;
+
+    /**
+     * Bundled template defaults, kept so a value of the wrong type can fall
+     * back to the documented default instead of throwing.
+     */
+    private Configuration configDefaults;
+
+    /** Typed values read once at load; the config object is not reloaded at runtime. */
+    private boolean debugEnabled;
+    private boolean secondAttemptCrackedEnabled;
 
     /**
      * Bundled config template resource name. Backends (bukkit/folia) use the
@@ -112,7 +149,12 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
     private UpdateChecker updateChecker;
 
     public FastLoginCore(T plugin) {
+        this(plugin, System::currentTimeMillis);
+    }
+
+    FastLoginCore(T plugin, LongSupplier verificationClock) {
         this.plugin = plugin;
+        this.verificationClock = verificationClock;
     }
 
     public void load() {
@@ -126,14 +168,19 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
             return;
         }
 
+        if (config.getSection("anti-bot").getKeys().contains("action")) {
+            plugin.getLog().warn("anti-bot.action is no longer supported; anti-bot always blocks");
+        }
+
         // Restore canonical comments and key order from the bundled template,
         // while preserving all user-modified values.
         try {
-            ConfigRefresher.refresh(
-                    getClass().getClassLoader(),
-                    plugin.getPluginFolder().resolve("config.yml"),
-                    config,
-                    configTemplate);
+            List<String> templateLines = ConfigRefreshAdapter.readTemplateLines(
+                    getClass().getClassLoader(), configTemplate);
+            if (templateLines != null) {
+                ConfigRefresher.refresh(plugin.getPluginFolder().resolve("config.yml"),
+                        templateLines, ConfigRefreshAdapter.flattenConfig(config));
+            }
         } catch (IOException ioEx) {
             plugin.getLog().warn("Could not refresh config.yml from template", ioEx);
             // non-fatal: continue with the config as-is
@@ -147,6 +194,11 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
             plugin.getLog().error("Failed to reload config.yml after refresh", ioEx);
             return;
         }
+
+        // Read these once: typed helpers warn on a wrong type, and isDebug() is
+        // called on hot logging paths where a warning per call would flood the log.
+        debugEnabled = readBoolean("debug");
+        secondAttemptCrackedEnabled = readBoolean("secondAttemptCracked");
 
         // 2. Determine language file based on config
         String language = config.getString("language");
@@ -171,33 +223,18 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
             saveDefaultFile(messagesFile, defaultMessagesFile);
         }
 
-        // Auto-fill missing keys from the English default
-        appendMissingKeys(defaultMessagesFile, messagesFile);
+        // Upgrade from bundled selected-language values, with English only as fallback.
+        appendMissingKeys(messagesFile, defaultMessagesFile);
 
         // 3. Load language file with English as default fallback
-        try {
-            Configuration messages = loadLanguageFile(messagesFile, defaultMessagesFile);
-
-            messages.getKeys()
-                    .stream()
-                    .filter(key -> messages.get(key) != null)
-                    .collect(toMap(identity(), messages::get))
-                    .forEach((key, message) -> {
-                        String colored = CommonUtil.translateColorCodes((String) message);
-                        if (!colored.isEmpty()) {
-                            localeMessages.put(key, colored.replace("/newline", "\n"));
-                        }
-                    });
-
-            plugin.getLog().info("Loaded language file: {}", messagesFile);
-        } catch (IOException ioEx) {
-            plugin.getLog().error("Failed to load language file: {}", messagesFile, ioEx);
-            return;
-        }
+        loadLanguageMessages(messagesFile, defaultMessagesFile);
 
         // Initialize the resolver based on the config parameter
         this.resolver = this.config.getBoolean("useProxyAgnosticResolver")
             ? new ProxyAgnosticMojangResolver() : new MojangResolver();
+
+        // the reachability probe uses the session server of that resolver
+        this.sessionProbe = new SessionServerProbe(resolver, SESSION_PROBE_CACHE_MS);
 
         antiBot = createAntiBotService(config.getSection("anti-bot"));
         // validate entries — a missing colon or non-numeric port
@@ -257,6 +294,115 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
             }
             updateChecker = new UpdateChecker(plugin.getLog(), currentVersion, isDebug());
         }
+    }
+
+    /**
+     * Reads a boolean without a raw cast. A value of another type is reported
+     * and replaced by the bundled template default; it never aborts startup.
+     *
+     * @param config the user configuration
+     * @param defaults the bundled template defaults, may be null
+     * @param key the config key
+     * @param logger the logger for the type mismatch warning
+     * @return the configured value or the template default
+     */
+    static boolean readBoolean(Configuration config, Configuration defaults, String key, Logger logger) {
+        Object value = config.get(key);
+        if (value instanceof Boolean) {
+            return ((Boolean) value).booleanValue();
+        }
+        Object fallbackValue = defaults == null ? null : defaults.get(key);
+        boolean fallback = fallbackValue instanceof Boolean
+                ? ((Boolean) fallbackValue).booleanValue() : false;
+        if (value != null) {
+            logger.warn("Config '{}' must be a boolean but is {}; using default {}",
+                    key, value.getClass().getSimpleName(), fallback);
+        }
+        return fallback;
+    }
+
+    /**
+     * Reads an integer without a raw cast. Numeric strings and other types are
+     * reported and replaced by the bundled template default.
+     *
+     * @param config the user configuration
+     * @param defaults the bundled template defaults, may be null
+     * @param key the config key
+     * @param logger the logger for the type mismatch warning
+     * @return the configured value or the template default
+     */
+    static int readInt(Configuration config, Configuration defaults, String key, Logger logger) {
+        Object value = config.get(key);
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        Object fallbackValue = defaults == null ? null : defaults.get(key);
+        int fallback = fallbackValue instanceof Number ? ((Number) fallbackValue).intValue() : 0;
+        if (value != null) {
+            logger.warn("Config '{}' must be a number but is {}; using default {}",
+                    key, value.getClass().getSimpleName(), fallback);
+        }
+        return fallback;
+    }
+
+    /**
+     * Reads a long without a raw cast. Numeric strings and other types are
+     * reported and replaced by the bundled template default.
+     *
+     * @param config the user configuration
+     * @param defaults the bundled template defaults, may be null
+     * @param key the config key
+     * @param logger the logger for the type mismatch warning
+     * @return the configured value or the template default
+     */
+    static long readLong(Configuration config, Configuration defaults, String key, Logger logger) {
+        Object value = config.get(key);
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        Object fallbackValue = defaults == null ? null : defaults.get(key);
+        long fallback = fallbackValue instanceof Number ? ((Number) fallbackValue).longValue() : 0L;
+        if (value != null) {
+            logger.warn("Config '{}' must be a number but is {}; using default {}",
+                    key, value.getClass().getSimpleName(), fallback);
+        }
+        return fallback;
+    }
+
+    /**
+     * Reads a string without a raw cast. A non-string value is reported and
+     * replaced by the bundled template default.
+     *
+     * @param config the user configuration
+     * @param defaults the bundled template defaults, may be null
+     * @param key the config key
+     * @param logger the logger for the type mismatch warning
+     * @return the configured value or the template default
+     */
+    static String readString(Configuration config, Configuration defaults, String key, Logger logger) {
+        Object value = config.get(key);
+        if (value instanceof String) {
+            return (String) value;
+        }
+        Object fallbackValue = defaults == null ? null : defaults.get(key);
+        String fallback = fallbackValue instanceof String ? (String) fallbackValue : "";
+        if (value != null) {
+            logger.warn("Config '{}' must be a string but is {}; using default '{}'",
+                    key, value.getClass().getSimpleName(), fallback);
+        }
+        return fallback;
+    }
+
+    private boolean readBoolean(String key) {
+        return readBoolean(config, configDefaults, key, plugin.getLog());
+    }
+
+    private int readInt(String key) {
+        return readInt(config, configDefaults, key, plugin.getLog());
+    }
+
+    private String readString(String key) {
+        return readString(config, configDefaults, key, plugin.getLog());
     }
 
     /**
@@ -321,19 +467,6 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
             globalLimiter = () -> true;
         }
 
-        // --- action ---
-        Action action = Action.Ignore;
-        switch (botSection.getString("action")) {
-            case "ignore":
-                action = Action.Ignore;
-                break;
-            case "block":
-                action = Action.Block;
-                break;
-            default:
-                plugin.getLog().warn("Invalid anti bot action - defaulting to ignore");
-        }
-
         // --- trusted IPs ---
         Set<InetAddress> trustedIps = new HashSet<>();
         for (String ip : botSection.getStringList("trusted-ips")) {
@@ -362,7 +495,7 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
                 botSection.getLong("ban-duration") * 60 * 1_000L, 300_000L);
         IpBanManager ipBanManager = new IpBanManager(ticker);
 
-        return new AntiBotService(plugin.getLog(), enabled, globalLimiter, action,
+        return new AntiBotService(plugin.getLog(), enabled, globalLimiter,
                 trustedIpSet, ipBanManager, perIpLimiter, banDurationMs, ticker);
     }
 
@@ -380,17 +513,8 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
 
         Path file = plugin.getPluginFolder().resolve(fileName);
 
-        Configuration config;
-        try (Reader reader = Files.newBufferedReader(file)) {
-            config = configProvider.load(reader, defaults);
-        }
-
-        // explicitly add keys here, because Configuration.getKeys doesn't return the keys from the default config
-        for (String key : defaults.getKeys()) {
-            config.set(key, config.get(key));
-        }
-
-        return config;
+        configDefaults = defaults;
+        return ConfigurationFiles.load(file, defaults, configurationLoader(configProvider));
     }
 
     public MojangResolver getResolver() {
@@ -443,9 +567,9 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
         if (type.contains("sqlite")) {
             storage = new SQLiteStorage(plugin, database, databaseConfig);
         } else {
-            String host = (String) config.get("host");
-            int port = ((Number) config.get("port")).intValue();
-            boolean useSSL = (boolean) config.get("useSSL");
+            String host = readString("host");
+            int port = readInt("port");
+            boolean useSSL = readBoolean("useSSL");
 
             if (useSSL) {
                 boolean publicKeyRetrieval = config.getBoolean("allowPublicKeyRetrieval");
@@ -457,19 +581,25 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
                 databaseConfig.addDataSourceProperty("sslMode", sslMode);
             }
 
-            databaseConfig.setUsername((String) config.get("username"));
+            databaseConfig.setUsername(readString("username"));
             databaseConfig.setPassword(config.getString("password"));
             storage = new MySQLStorage(plugin, type, host, port, database, databaseConfig, useSSL);
         }
 
         try {
             storage.createTables();
+            // config and storage are both in place now: align the stored
+            // observation flags with the configured fallback semantics
+            reconcileSameNameCracked();
+            // the settlement sweep judges unverified attempts in time,
+            // independent of when (or whether) the player reconnects
+            startVerificationSettlement();
             return true;
         } catch (Exception ex) {
-            plugin.getLog().warn("Failed to setup database. Disabling plugin...", ex);
-            // the HikariDataSource was already constructed — close
-            // it here, because setEnabled(false) during onEnable suppresses
-            // onDisable (and with it core.close()) on bukkit/folia
+            plugin.getLog().warn("Failed to set up the database; FastLoginPlus cannot run without it", ex);
+            // the HikariDataSource was already constructed — close it here so
+            // the failure path releases it before the platform disables the
+            // plugin (on Bukkit/Folia setEnabled(false) also runs onDisable)
             if (storage != null) {
                 storage.close();
                 storage = null;
@@ -482,8 +612,59 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
         return config;
     }
 
+    /**
+     * Returns the bundled template defaults used by the tolerant readers.
+     * Shared callers in this package pass both configurations to
+     * {@link #readBoolean(Configuration, Configuration, String, Logger)} and
+     * its siblings so a misconfigured value falls back to the shipped default.
+     *
+     * @return the bundled template defaults, or null before they are loaded
+     */
+    Configuration getConfigDefaults() {
+        return configDefaults;
+    }
+
+    /**
+     * Aligns the stored same-name cracked observations with the
+     * configured {@code secondAttemptCracked} semantics.
+     *
+     * <p>The read side consults the config wherever the observation is used and
+     * is authoritative ("switch off = as if never recorded"). This method is the
+     * bookkeeping side: the config can change while the server is down, so there
+     * is no runtime "changed true -&gt; false" event to catch — only reconciling
+     * whenever config and storage are (re)initialized keeps the database
+     * consistent, and keeps stale marks from resurfacing when an administrator
+     * toggles the switch back and forth. With the fallback disabled the marks
+     * are cleared ({@code SameNameCracked = 0}, only that column); with it
+     * enabled nothing is touched.</p>
+     */
+    public void reconcileSameNameCracked() {
+        reconcileSameNameCracked(storage, config != null && secondAttemptCrackedEnabled, plugin.getLog());
+    }
+
+    /**
+     * Decision half of {@link #reconcileSameNameCracked()}, split out so the
+     * "cleared when off, untouched when on" contract is unit-testable.
+     *
+     * @param storage the storage holding the observation flags, may be null
+     * @param fallbackEnabled the configured {@code secondAttemptCracked} value
+     * @param log the logger for the reconciliation report
+     */
+    public static void reconcileSameNameCracked(SQLStorage storage, boolean fallbackEnabled,
+                                                org.slf4j.Logger log) {
+        if (storage == null || fallbackEnabled) {
+            return;
+        }
+
+        int cleared = storage.clearSameNameCrackedObservations();
+        if (cleared > 0) {
+            log.info("Cleared {} same-name cracked observation(s): secondAttemptCracked is disabled,"
+                    + " such names verify again", cleared);
+        }
+    }
+
     public boolean isDebug() {
-        return config != null && (boolean) config.get("debug");
+        return config != null && debugEnabled;
     }
 
     public PasswordGenerator<P> getPasswordGenerator() {
@@ -495,16 +676,273 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
         this.passwordGenerator = passwordGenerator;
     }
 
-    public void addLoginAttempt(String ip, String username) {
-        pendingLogin.put(ip + username, new Object());
+    /**
+     * Records a requested verification for settlement after the authentication grace period.
+     * Repeated requests within one connection share the original start time.
+     *
+     * @param username exact login name of the attempt
+     */
+    public void markPendingVerification(String username) {
+        pendingVerifications.putIfAbsent(attemptKey(username),
+                new PendingVerification(verificationClock.getAsLong(), null));
     }
 
-    public boolean hasFailedLogin(String ip, String username) {
-        if (!(boolean) config.get("secondAttemptCracked")) {
-            return false;
+    /**
+     * Binds a proxy attempt to its original connection, including the pre-player phase.
+     * Reconnecting does not extend the grace period: the deadline stays at the
+     * name's first unverified request, so repeatedly reconnecting cannot postpone
+     * the settlement forever.
+     *
+     * <p>A connection that closes before a verdict is not discarded: a proxy performs
+     * the verification itself, so its rejection reaches FLP only as a closed
+     * connection. The attempt is settled like any other instead of guessing which
+     * of rejection, cancellation and network loss produced the close.</p>
+     *
+     * @param username login name
+     * @param owner connection identity token
+     */
+    public void markPendingVerification(String username, Object owner) {
+        pendingVerifications.compute(attemptKey(username), (key, pending) -> {
+            if (pending == null) {
+                return new PendingVerification(verificationClock.getAsLong(), owner);
+            }
+            // a retry replaces the owner but keeps the first request's deadline
+            return pending.owner == owner ? pending
+                    : new PendingVerification(pending.startedAt, owner);
+        });
+    }
+
+    /**
+     * Records a definitive "not premium" verdict for the name: the
+     * session server explicitly rejected the verification. This is the only
+     * observation that counts towards the same-name cracked record.
+     *
+     * @param username exact login name that failed the verification
+     */
+    public void recordDefiniteFailure(String username) {
+        pendingVerifications.compute(attemptKey(username), (key, pending) -> {
+            definiteFailures.merge(key, 1, Integer::sum);
+            return null;
+        });
+    }
+
+    /**
+     * Drops a pending verification without counting it: the caller obtained an
+     * explicit "could not tell" verdict, such as an authentication outage.
+     * A closed connection is not such a verdict and is settled normally.
+     *
+     * @param username exact login name whose attempt ended without a verdict
+     */
+    public void dropPendingVerification(String username) {
+        pendingVerifications.remove(attemptKey(username));
+    }
+
+    /**
+     * Settles one attempt as a definitive failure when the proxy reports that the
+     * client answered encryption but no player was created. The count is applied
+     * only while the attempt still belongs to that connection: a later attempt or
+     * an already successful login is left untouched.
+     *
+     * @param username exact login name
+     * @param owner connection identity token of the attempt
+     * @return true when the matching attempt was still pending and was counted
+     */
+    public boolean settleVerificationAsFailure(String username, Object owner) {
+        String key = attemptKey(username);
+        boolean[] counted = {false};
+        pendingVerifications.computeIfPresent(key, (pendingKey, pending) -> {
+            if (pending.owner != owner) {
+                return pending;
+            }
+            definiteFailures.merge(pendingKey, 1, Integer::sum);
+            counted[0] = true;
+            return null;
+        });
+        if (counted[0]) {
+            plugin.getLog().warn("Premium verification for {} failed before the player was created: "
+                    + "counted as a failed verification", key);
+        }
+        return counted[0];
+    }
+
+    /**
+     * A passing verification refutes everything recorded for the name: the
+     * pending mark and every counted failure.
+     *
+     * @param username exact login name that verified
+     */
+    public void resetVerificationState(String username) {
+        pendingVerifications.compute(attemptKey(username), (key, pending) -> {
+            definiteFailures.remove(key);
+            return null;
+        });
+    }
+
+    /**
+     * How many definitive "not premium" verdicts were settled for the name
+     * since the last passing verification. One is enough to confirm the
+     * same-name cracked observation.
+     *
+     * @param username exact login name
+     * @return the count of settled definitive failures
+     */
+    public int getDefiniteFailures(String username) {
+        return definiteFailures.getOrDefault(attemptKey(username), 0);
+    }
+
+    /**
+     * Settles pending verifications only after the authentication grace period.
+     * An attempt that produced no verdict — the client failed verification,
+     * cancelled, or its connection closed — is judged by a session-server
+     * reachability probe at that moment: the server answers -> count one
+     * definitive failure; it cannot be reached (an authentication outage) ->
+     * drop the attempt without counting and without any action.
+     *
+     * <p>A closed connection is not treated as "could not tell": on a proxy the
+     * service performs the verification itself, so a rejection and a player
+     * leaving are both observed only as a closed connection. Distinguishing them
+     * is not possible from FLP's side, so the attempt is settled uniformly.</p>
+     */
+    public void settlePendingVerifications() {
+        long now = verificationClock.getAsLong();
+        if (sessionProbe == null || pendingVerifications.values().stream().noneMatch(pending -> pending.isDue(now))) {
+            return;
         }
 
-        return pendingLogin.remove(ip + username) != null;
+        settlePendingVerifications(sessionProbe.isReachable(), now);
+    }
+
+    /**
+     * Settles only this name's previous attempt before routing a new connection.
+     * An expired attempt is settled even when its connection has already closed.
+     * An attempt still inside the grace period stays pending; the new connection
+     * keeps its original deadline instead of starting a fresh one.
+     *
+     * @param username exact login name of the returning player
+     */
+    public void settlePendingVerification(String username) {
+        String key = attemptKey(username);
+        PendingVerification pending = pendingVerifications.get(key);
+        if (pending != null) {
+            long now = verificationClock.getAsLong();
+            boolean reachable = pending.isDue(now) && sessionProbe != null && sessionProbe.isReachable();
+            settlePendingVerification(key, pending, reachable, now);
+        }
+    }
+
+    /**
+     * Decision half of {@link #settlePendingVerifications()}, split out so the
+     * counting rules are unit-testable without waiting for real time.
+     *
+     * @param sessionServerReachable whether the session server answered the probe
+     */
+    void settlePendingVerifications(boolean sessionServerReachable) {
+        settlePendingVerifications(sessionServerReachable, verificationClock.getAsLong());
+    }
+
+    private void settlePendingVerifications(boolean sessionServerReachable, long now) {
+        pendingVerifications.forEach((username, pending) ->
+                settlePendingVerification(username, pending, sessionServerReachable, now));
+    }
+
+    private void settlePendingVerification(String username, PendingVerification attempt,
+                                           boolean sessionServerReachable, long now) {
+        pendingVerifications.computeIfPresent(username, (key, pending) -> {
+            // A probe result for an old attempt must not consume a replacement.
+            if (pending != attempt) {
+                return pending;
+            }
+            if (!pending.isDue(now)) {
+                return pending;
+            }
+            if (sessionServerReachable) {
+                definiteFailures.merge(key, 1, Integer::sum);
+                plugin.getLog().warn("Premium verification for {} never completed while the session "
+                        + "server answers: counted as a failed verification", key);
+            } else {
+                plugin.getLog().warn("Premium verification for {} never completed and the session "
+                        + "server is unreachable: treated as an authentication outage, nothing recorded", key);
+            }
+            return null;
+        });
+    }
+
+    private static final class PendingVerification {
+        private final long startedAt;
+        private final Object owner;
+
+        private PendingVerification(long startedAt, Object owner) {
+            this.startedAt = startedAt;
+            this.owner = owner;
+        }
+
+        private boolean isDue(long now) {
+            return now - startedAt >= VERIFICATION_GRACE_MS;
+        }
+    }
+
+    /**
+     * Starts the settlement sweep: a self-chaining delayed task, so the
+     * settlement never degenerates into "when the player next connects".
+     */
+    public void startVerificationSettlement() {
+        if (settling) {
+            return;
+        }
+
+        settling = true;
+        scheduleVerificationSettlement();
+    }
+
+    private void scheduleVerificationSettlement() {
+        plugin.getScheduler().runAsyncDelayed(() -> {
+            if (!settling) {
+                return;
+            }
+
+            try {
+                settlePendingVerifications();
+            } catch (Exception ex) {
+                plugin.getLog().warn("Failed to settle pending verifications", ex);
+            }
+
+            scheduleVerificationSettlement();
+        }, VERIFICATION_SETTLEMENT_SWEEP);
+    }
+
+    private static String attemptKey(String username) {
+        return username == null ? "" : username.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Owes the name its one-time "recorded as cracked" chat notice: called when
+     * the same-name cracked observation is confirmed for the first time.
+     *
+     * @param username exact login name
+     */
+    public void queueSameNameCrackedNotice(String username) {
+        sameNameCrackedNotices.put(attemptKey(username), Boolean.TRUE);
+    }
+
+    /**
+     * Whether the name still owes its one-time notice; the entry is consumed
+     * either way so a notice is never delivered twice for one confirmation.
+     *
+     * @param username exact login name
+     * @return true when the notice was queued and not yet delivered
+     */
+    public boolean consumeSameNameCrackedNotice(String username) {
+        return sameNameCrackedNotices.remove(attemptKey(username)) != null;
+    }
+
+    /**
+     * Checks pending notification work without consuming it during capability negotiation.
+     *
+     * @param username exact login name
+     * @return whether the first-confirmation notice is still owed
+     */
+    public boolean hasSameNameCrackedNotice(String username) {
+        return sameNameCrackedNotices.containsKey(attemptKey(username));
     }
 
     public Collection<UUID> getPendingConfirms() {
@@ -584,104 +1022,180 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
     }
 
     /**
-     * Compare the user's language file against the default (English) and append any missing keys.
-     * @param defaultFile the default resource file in the jar (e.g. messages_en.yml)
+     * Appends localized missing keys and refreshes untouched defaults from older message versions.
      * @param userFile the user's language file in the plugin folder (e.g. messages_zh.yml)
+     * @param defaultFile the English fallback resource in the jar
      */
-    private void appendMissingKeys(String defaultFile, String userFile) {
-        Path dataFolder = plugin.getPluginFolder();
-        Path userFilePath = dataFolder.resolve(userFile);
-        if (Files.notExists(userFilePath)) {
+    private void appendMissingKeys(String userFile, String defaultFile) {
+        Path file = plugin.getPluginFolder().resolve(userFile);
+        if (!Files.exists(file)) {
             return;
         }
-
-        ConfigurationProvider configProvider = ConfigurationProvider.getProvider(YamlConfiguration.class);
-
-        Configuration defaults;
-        try (InputStream defaultStream = getClass().getClassLoader().getResourceAsStream(defaultFile)) {
-            defaults = configProvider.load(defaultStream);
-        } catch (IOException ioEx) {
-            plugin.getLog().error("Cannot read default resource {}", defaultFile, ioEx);
-            return;
+        ConfigurationProvider provider = ConfigurationProvider.getProvider(YamlConfiguration.class);
+        try (InputStream english = getClass().getClassLoader().getResourceAsStream(defaultFile);
+             InputStream selected = getClass().getClassLoader().getResourceAsStream(userFile)) {
+            if (english == null) {
+                throw new IOException("Missing bundled English messages");
+            }
+            Configuration defaults = provider.load(new InputStreamReader(english, StandardCharsets.UTF_8));
+            Configuration localized = selected == null ? defaults
+                    : provider.load(new InputStreamReader(selected, StandardCharsets.UTF_8));
+            updateLanguageFile(userFile, defaultFile, defaults, localized);
+        } catch (IOException | RuntimeException failure) {
+            plugin.getLog().error("Cannot upgrade language file {}; it will be ignored",
+                    userFile, failure);
         }
+    }
 
-        Configuration userConfig;
-        try (Reader reader = Files.newBufferedReader(userFilePath)) {
-            userConfig = configProvider.load(reader);
-        } catch (IOException ioEx) {
-            plugin.getLog().error("Cannot read user file {}", userFile, ioEx);
-            return;
+    private void updateLanguageFile(String userFile, String defaultFile, Configuration defaults,
+                                    Configuration localized) throws IOException {
+        Path file = plugin.getPluginFolder().resolve(userFile);
+        ConfigurationProvider provider = ConfigurationProvider.getProvider(YamlConfiguration.class);
+        int userVersion;
+        try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            userVersion = LanguageFileUpdater.version(provider.load(reader));
         }
-
-        Set<String> defaultKeys = new HashSet<>(defaults.getKeys());
-        Set<String> userKeys = new HashSet<>(userConfig.getKeys());
-
-        Set<String> missingKeys = new HashSet<>(defaultKeys);
-        missingKeys.removeAll(userKeys);
-
-        if (missingKeys.isEmpty()) {
-            return;
+        int currentVersion = LanguageFileUpdater.version(localized);
+        Configuration previous = null;
+        if (currentVersion > userVersion) {
+            previous = loadMessageSnapshot(provider, userVersion, userFile, defaultFile);
+            if (userVersion > 0 && previous == null) {
+                plugin.getLog().warn("Cannot refresh {}: no snapshot for messages v{}", userFile, userVersion);
+            }
         }
-
-        StringBuilder appendBuilder = new StringBuilder();
-        appendBuilder.append(System.lineSeparator());
-        appendBuilder.append("# === Keys below are auto-added by FastLoginPlus ===").append(System.lineSeparator());
-        for (String key : missingKeys) {
-            Object value = defaults.get(key);
-            String yamlValue = value instanceof String ? (String) value : String.valueOf(value);
-            appendBuilder.append(key).append(": '").append(yamlValue.replace("'", "''")).append('\'')
-                    .append(System.lineSeparator());
+        LanguageFileUpdater.Result result = LanguageFileUpdater.update(
+                file, defaults, localized, currentVersion, previous);
+        if (result.added > 0) {
+            plugin.getLog().info("Appended {} missing keys to {}", result.added, userFile);
         }
+        if (result.refreshed > 0) {
+            plugin.getLog().info("Refreshed {} unchanged message values to messages v{} in {}",
+                    result.refreshed, currentVersion, userFile);
+        }
+        Set<String> knownKeys = new HashSet<>(defaults.getKeys());
+        knownKeys.addAll(localized.getKeys());
+        LanguageFileKeys.Diagnostics diagnostics = LanguageFileKeys.inspect(file, knownKeys);
+        if (!diagnostics.missing().isEmpty()) {
+            plugin.getLog().warn("Language file {} is missing {} message keys: {}", userFile,
+                    diagnostics.missing().size(), String.join(", ", diagnostics.missing()));
+        }
+        if (!diagnostics.redundant().isEmpty()) {
+            plugin.getLog().warn("Language file {} has {} message keys not in the bundled defaults "
+                            + "(kept, not deleted): {}", userFile,
+                    diagnostics.redundant().size(), String.join(", ", diagnostics.redundant()));
+        }
+    }
 
-        try {
-            Files.write(userFilePath, appendBuilder.toString().getBytes(StandardCharsets.UTF_8),
-                    StandardOpenOption.APPEND);
-            plugin.getLog().info("Appended {} missing keys to {}", missingKeys.size(), userFile);
-        } catch (IOException ioEx) {
-            plugin.getLog().error("Cannot append missing keys to {}", userFile, ioEx);
+    private Configuration loadMessageSnapshot(ConfigurationProvider provider, int version,
+                                              String userFile, String defaultFile) throws IOException {
+        String archive = "messages/archive/" + version + "/";
+        try (InputStream selected = getClass().getClassLoader().getResourceAsStream(archive + userFile)) {
+            if (selected != null) {
+                return provider.load(new InputStreamReader(selected, StandardCharsets.UTF_8));
+            }
+        }
+        try (InputStream english = getClass().getClassLoader().getResourceAsStream(archive + defaultFile)) {
+            return english == null ? null : provider.load(new InputStreamReader(english, StandardCharsets.UTF_8));
         }
     }
 
     /**
-     * Load a language file with the English default as fallback.
-     * Keys from the default file are used when the language file doesn't have them.
+     * Loads the selected language and falls back to the bundled language when the user file
+     * is missing or not valid YAML. A broken language file must not disable the plugin.
      *
-     * @param langFile the language file name in the plugin folder
-     * @param defaultFile the default resource file name in the jar
-     * @return the merged configuration
-     * @throws IOException if the file cannot be read
+     * @param messagesFile the user's language file name
+     * @param defaultFile the English fallback resource in the jar
      */
-    private Configuration loadLanguageFile(String langFile, String defaultFile) throws IOException {
-        ConfigurationProvider configProvider = ConfigurationProvider.getProvider(YamlConfiguration.class);
-
-        // Load English defaults as the base
-        Configuration defaults;
-        try (InputStream defaultStream = getClass().getClassLoader().getResourceAsStream(defaultFile)) {
-            defaults = configProvider.load(defaultStream);
-        }
-
-        Path filePath = plugin.getPluginFolder().resolve(langFile);
-
-        Configuration config;
-        if (Files.exists(filePath)) {
-            try (Reader reader = Files.newBufferedReader(filePath)) {
-                config = configProvider.load(reader, defaults);
+    void loadLanguageMessages(String messagesFile, String defaultFile) {
+        Path file = plugin.getPluginFolder().resolve(messagesFile);
+        try {
+            ConfigurationProvider provider = ConfigurationProvider.getProvider(YamlConfiguration.class);
+            Configuration defaults;
+            try (InputStream input = getClass().getClassLoader().getResourceAsStream(defaultFile)) {
+                if (input == null) {
+                    throw new IOException("Missing bundled language defaults: " + defaultFile);
+                }
+                defaults = provider.load(input);
             }
-        } else {
-            // Language file doesn't exist, use defaults only
-            config = defaults;
+            Configuration bundled = loadBundledLanguage(messagesFile, defaults, provider);
+            ConfigurationFiles.Loader<Configuration> loader = new BungeeConfigurationLoader(provider) {
+                @Override
+                public Configuration load(Reader reader, Configuration fallback) throws IOException {
+                    Configuration loaded = super.load(reader, fallback);
+                    // Rendering validates message types before publishing any locale state.
+                    renderLanguageMessages(loaded);
+                    return loaded;
+                }
+            };
+            LanguageMessages.Result<Configuration> result = LanguageMessages.loadWithFallback(
+                    file, defaults, bundled, loader,
+                    failure -> plugin.getLog().error(
+                            "Invalid language file {}; falling back to bundled defaults", file, failure));
+            localeMessages = renderLanguageMessages(result.getValue());
+            if (result.isFallback()) {
+                plugin.getLog().warn("Loaded bundled language fallback for {}", file);
+            } else {
+                plugin.getLog().info("Loaded language file: {}", messagesFile);
+            }
+        } catch (IOException | RuntimeException failure) {
+            localeMessages = Collections.emptyMap();
+            plugin.getLog().error("Failed to load bundled language messages for {}", file, failure);
+        }
+    }
+
+    private Map<String, String> renderLanguageMessages(Configuration messages) {
+        Map<String, String> rendered = new HashMap<>();
+        LanguageMessages.populate(messages.getKeys(), messages::get, rendered);
+        return Collections.unmodifiableMap(rendered);
+    }
+
+    private Configuration loadBundledLanguage(String messagesFile, Configuration defaults,
+                                              ConfigurationProvider provider) throws IOException {
+        try (InputStream selected = getClass().getClassLoader().getResourceAsStream(messagesFile)) {
+            if (selected == null) {
+                return defaults;
+            }
+            try (Reader reader = new InputStreamReader(selected, StandardCharsets.UTF_8)) {
+                return ConfigurationFiles.includeDefaultKeys(provider.load(reader, defaults), defaults,
+                        configurationLoader(provider));
+            }
+        }
+    }
+
+    static ConfigurationFiles.Loader<Configuration> configurationLoader(ConfigurationProvider provider) {
+        return new BungeeConfigurationLoader(provider);
+    }
+
+    private static class BungeeConfigurationLoader implements ConfigurationFiles.Loader<Configuration> {
+        private final ConfigurationProvider provider;
+
+        BungeeConfigurationLoader(ConfigurationProvider provider) {
+            this.provider = provider;
         }
 
-        // Explicitly add keys from defaults, because Configuration.getKeys()
-        // doesn't return keys that only exist in the default config
-        for (String key : defaults.getKeys()) {
-            config.set(key, config.get(key));
+        @Override
+        public Configuration load(Reader reader, Configuration defaults) throws IOException {
+            return provider.load(reader, defaults);
         }
 
-        return config;
+        @Override
+        public Collection<String> getKeys(Configuration config) {
+            return config.getKeys();
+        }
+
+        @Override
+        public Object get(Configuration config, String key) {
+            return config.get(key);
+        }
+
+        @Override
+        public void set(Configuration config, String key, Object value) {
+            config.set(key, value);
+        }
     }
 
     public void close() {
+        settling = false;
         plugin.getLog().info("Safely shutting down scheduler. This could take up to one minute.");
 
         if (storage != null) {

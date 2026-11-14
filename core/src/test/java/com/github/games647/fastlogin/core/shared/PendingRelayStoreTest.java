@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.shared;
 
@@ -255,5 +236,53 @@ class PendingRelayStoreTest {
         assertEquals(Boolean.TRUE, restored.getToggle("Steve"));
         assertTrue(restored.containsDelete("Notch"));
         assertTrue(restored.premiumNotices().isEmpty());
+    }
+
+    @Test
+    void preTimestampFileStartsAgingAtLoad() throws Exception {
+        Files.write(tempDir.resolve("pending-relay.json"),
+            "{\"toggles\":{\"Steve\":true}}".getBytes("UTF-8"));
+
+        PendingRelayStore restored = new PendingRelayStore(tempDir, logger());
+        assertTrue(restored.load());
+
+        // the migrated entry counts as freshly queued, not as arbitrarily old
+        assertTrue(restored.isRecentPremiumToggle("Steve",
+                PendingRelayStore.PENDING_PREMIUM_RELAXATION_MILLIS));
+    }
+
+    @Test
+    void staleEntriesAreDroppedOnLoad() throws Exception {
+        long old = System.currentTimeMillis()
+                - PendingRelayStore.MAX_ENTRY_AGE_MILLIS - 60_000L;
+        Files.write(tempDir.resolve("pending-relay.json"),
+            ("{\"toggles\":{\"Steve\":true},\"toggleTimes\":{\"Steve\":" + old + "},"
+                + "\"deletes\":[\"Notch\"],\"deleteTimes\":{\"Notch\":" + old + "}}").getBytes("UTF-8"));
+
+        PendingRelayStore restored = new PendingRelayStore(tempDir, logger());
+        assertFalse(restored.load());
+        assertFalse(restored.containsToggle("Steve"));
+        assertFalse(restored.containsDelete("Notch"));
+        assertFalse(restored.hasPending());
+    }
+
+    @Test
+    void onlyRecentPremiumTogglesRelaxTheAdmissionCheck() throws Exception {
+        long now = System.currentTimeMillis();
+        long stale = now - PendingRelayStore.PENDING_PREMIUM_RELAXATION_MILLIS - 60_000L;
+        Files.write(tempDir.resolve("pending-relay.json"),
+            ("{\"toggles\":{\"Steve\":true,\"Alex\":false},"
+                + "\"toggleTimes\":{\"Steve\":" + stale + ",\"Alex\":" + now + "}}").getBytes("UTF-8"));
+
+        PendingRelayStore restored = new PendingRelayStore(tempDir, logger());
+        assertTrue(restored.load());
+
+        // still queued for relay, but too old to reopen the UUID-mismatch exception
+        assertEquals(Boolean.TRUE, restored.getToggle("Steve"));
+        assertFalse(restored.isRecentPremiumToggle("Steve",
+                PendingRelayStore.PENDING_PREMIUM_RELAXATION_MILLIS));
+        // a cracked toggle never relaxes it, however recent
+        assertFalse(restored.isRecentPremiumToggle("Alex",
+                PendingRelayStore.PENDING_PREMIUM_RELAXATION_MILLIS));
     }
 }

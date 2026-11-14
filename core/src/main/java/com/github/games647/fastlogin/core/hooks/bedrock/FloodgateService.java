@@ -1,46 +1,60 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.hooks.bedrock;
 
 import com.github.games647.fastlogin.core.shared.FastLoginCore;
 import com.github.games647.fastlogin.core.shared.LoginSource;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
+import com.google.common.base.Ticker;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import org.geysermc.floodgate.api.FloodgateApi;
 import org.geysermc.floodgate.api.player.FloodgatePlayer;
 
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 public class FloodgateService extends BedrockService<FloodgatePlayer> {
 
     private final FloodgateApi floodgate;
+    private final Cache<FloodgatePlayer, String> preLoginRequests;
 
     public FloodgateService(FloodgateApi floodgate, FastLoginCore<?, ?, ?> core) {
+        this(floodgate, core, Ticker.systemTicker());
+    }
+
+    FloodgateService(FloodgateApi floodgate, FastLoginCore<?, ?, ?> core, Ticker ticker) {
         super(core);
         this.floodgate = floodgate;
+        // Match AuthMe 6.0.1's request lifetime. Weak identity keys cannot follow a reconnect.
+        this.preLoginRequests = CacheBuilder.newBuilder().weakKeys().maximumSize(4096)
+                .expireAfterWrite(15, TimeUnit.SECONDS).ticker(ticker).build();
+    }
+
+    /**
+     * Remembers an accepted request solely to suppress late proxy duplicates.
+     *
+     * @param player the Floodgate object for this connection
+     * @param username the backend name whose login was requested
+     */
+    public void rememberPreLoginRequest(FloodgatePlayer player, String username) {
+        preLoginRequests.put(player, username);
+    }
+
+    /**
+     * Checks a pending request, not authentication. New connection objects never inherit it.
+     *
+     * @param player the current Floodgate connection
+     * @param username the current backend name
+     * @return whether the same connection recently queued this name's login
+     */
+    public boolean hasPreLoginRequest(FloodgatePlayer player, String username) {
+        return username.equals(preLoginRequests.getIfPresent(player));
     }
 
     /**
@@ -84,8 +98,10 @@ public class FloodgateService extends BedrockService<FloodgatePlayer> {
         if (floodgatePlayer == null) {
             // the player disconnected between the two Bedrock
             // session lookups — treat as no Bedrock context and skip
-            core.getPlugin().getLog().info(
-                    "No Bedrock session for {} anymore — skipping Floodgate checks", username);
+            if (core.isDebug()) {
+                core.getPlugin().getLog().info(
+                        "No Bedrock session for {} anymore — skipping Floodgate checks", username);
+            }
             return true;
         }
         boolean isLinked = floodgatePlayer.getLinkedPlayer() != null;
@@ -94,7 +110,9 @@ public class FloodgateService extends BedrockService<FloodgatePlayer> {
             || "linked".equals(allowConflict) && !isLinked) {
             super.checkNameConflict(username, source);
         } else {
-            core.getPlugin().getLog().info("Skipping name conflict checking for player {}", username);
+            if (core.isDebug()) {
+                core.getPlugin().getLog().info("Skipping name conflict checking for player {}", username);
+            }
         }
 
         //Floodgate users don't need Java specific checks

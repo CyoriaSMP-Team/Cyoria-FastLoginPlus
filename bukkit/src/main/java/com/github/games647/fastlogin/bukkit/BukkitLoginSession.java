@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit;
 
@@ -32,6 +13,7 @@ import com.github.games647.fastlogin.core.storage.StoredProfile;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -49,6 +31,7 @@ public class BukkitLoginSession extends LoginSession {
 
     private boolean verified;
     private SkinProperty skinProperty;
+    private UUID connectionUuid;
 
     // one-shot guard for the encryption verification — a malicious
     // client can send duplicate ENCRYPTION_BEGIN packets; without this guard
@@ -109,6 +92,31 @@ public class BukkitLoginSession extends LoginSession {
      */
     public synchronized Optional<SkinProperty> getSkin() {
         return Optional.ofNullable(skinProperty);
+    }
+
+    /**
+     * The UUID this login connection carries, as reported by the pre-login event.
+     * <p>
+     * The login-session cache is keyed by address including the port, which the
+     * pre-login event does not expose. This UUID is the identifier that survives
+     * from the handshake/verification stage to the pre-login stage, so skins are
+     * matched by it instead of by player name alone.
+     *
+     * @return the connection UUID, or null while it is not known yet
+     */
+    @Nullable
+    public synchronized UUID getConnectionUuid() {
+        return connectionUuid;
+    }
+
+    /**
+     * Records the UUID this login connection carries.
+     *
+     * @param connectionUuid the UUID {@code AsyncPlayerPreLoginEvent#getUniqueId()}
+     *                       reports for this connection, or null when unknown
+     */
+    public synchronized void setConnectionUuid(@Nullable UUID connectionUuid) {
+        this.connectionUuid = connectionUuid;
     }
 
     /**

@@ -1,34 +1,19 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bungee.listener;
+
+import com.github.games647.fastlogin.core.shared.ForwardingAttributes;
+import com.github.games647.fastlogin.protocol.IdentityClaim;
 
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.util.function.Consumer;
+import java.util.UUID;
 
 /**
  * Shape-independent access to the property array of a BungeeCord login profile
@@ -50,8 +35,8 @@ import java.util.function.Consumer;
  * provide (the signature stays unset, which is what an unsigned property means).</p>
  *
  * <p>Every entry point reports failure through the given reporter instead of throwing: the
- * property list is an optimisation for the backend, never a requirement for the login, and a
- * proxy shape we do not recognise must not cost the player their connection.</p>
+ * proxy continues the login on an unsupported shape. Backends may still refuse an unsigned
+ * premium UUID when its authenticated identity claim could not be attached.</p>
  */
 final class LoginProfileProperties {
 
@@ -61,6 +46,93 @@ final class LoginProfileProperties {
     private static final String NAME_GETTER = "getName";
 
     private LoginProfileProperties() {
+    }
+
+    static boolean attachIdentity(Object profile, IdentityClaim claim, String proxyId,
+                                  Consumer<Throwable> onFailure) {
+        try {
+            if (profile == null) {
+                throw new IllegalStateException("Missing identity profile");
+            }
+            String value = claim.encode();
+            String signature = IdentityClaim.sign(value, UUID.fromString(proxyId));
+            return attach(profile, ForwardingAttributes.IDENTITY, value, onFailure)
+                    && attach(profile, ForwardingAttributes.IDENTITY_SIGNATURE, signature, onFailure);
+        } catch (RuntimeException | LinkageError failure) {
+            onFailure.accept(failure);
+            return false;
+        }
+    }
+
+    /**
+     * Checks the offline forwarding carrier without creating a live player profile.
+     *
+     * @param handlerClass the loaded proxy connection implementation, or null if missing
+     * @param onFailure receives the capability failure
+     * @return whether the required members are accessible
+     */
+    static boolean probeOfflineCarrier(Class<?> handlerClass, Consumer<Throwable> onFailure) {
+        try {
+            if (handlerClass == null) {
+                throw new ClassNotFoundException("Bungee login handler unavailable");
+            }
+            Field profile = loginProfileField(handlerClass);
+            Class<?> type = profile.getType();
+            java.lang.reflect.Method getter = handlerClass.getMethod("getLoginProfile");
+            if (!type.isAssignableFrom(getter.getReturnType())) {
+                throw new NoSuchMethodException("Unexpected login profile return type");
+            }
+            Field properties = type.getDeclaredField(PROPERTIES_FIELD);
+            properties.setAccessible(true);
+            Class<?> array = properties.getType();
+            Class<?> property = array.getComponentType();
+            type.getConstructor(String.class, String.class, array);
+            property.getConstructor(String.class, String.class);
+            property.getMethod(NAME_GETTER);
+            return true;
+        } catch (ReflectiveOperationException | LinkageError | RuntimeException failure) {
+            onFailure.accept(failure);
+            return false;
+        }
+    }
+
+    /**
+     * Creates the offline carrier without changing authentication or connection UUID.
+     *
+     * @param connection the login connection
+     * @param name the forwarded name
+     * @param uuid the forwarded connection UUID
+     * @param onFailure receives the injection failure
+     * @return whether a profile is available
+     */
+    static boolean ensureOfflineProfile(Object connection, String name, UUID uuid, Consumer<Throwable> onFailure) {
+        try {
+            Field profile = loginProfileField(connection.getClass());
+            if (profile.get(connection) == null) {
+                Class<?> type = profile.getType();
+                Class<?> array = type.getDeclaredField(PROPERTIES_FIELD).getType();
+                Object empty = Array.newInstance(array.getComponentType(), 0);
+                profile.set(connection, type.getConstructor(String.class, String.class, array)
+                        .newInstance(uuid.toString().replace("-", ""), name, empty));
+            }
+            return true;
+        } catch (ReflectiveOperationException | LinkageError | RuntimeException failure) {
+            onFailure.accept(failure);
+            return false;
+        }
+    }
+
+    private static Field loginProfileField(Class<?> owner) throws NoSuchFieldException {
+        while (owner != null) {
+            try {
+                Field field = owner.getDeclaredField("loginProfile");
+                field.setAccessible(true);
+                return field;
+            } catch (NoSuchFieldException absent) {
+                owner = owner.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException("loginProfile");
     }
 
     /**
@@ -132,6 +204,53 @@ final class LoginProfileProperties {
             }
             Array.set(updated, index, constructor.newInstance(name, value));
 
+            field.set(loginProfile, updated);
+            return true;
+        } catch (ReflectiveOperationException | LinkageError | RuntimeException failure) {
+            onFailure.accept(failure);
+            return false;
+        }
+    }
+
+    /**
+     * Drops every property with the given name, keeping the rest in order.
+     *
+     * <p>Used to remove client-supplied copies of a reserved FastLoginPlus
+     * property before the proxy attaches its own value.</p>
+     *
+     * @param loginProfile the BungeeCord login profile; may be null
+     * @param name         the property name to drop
+     * @param onFailure    receives the reason when the profile could not be updated
+     * @return true when the profile no longer carries a property of that name
+     */
+    static boolean remove(Object loginProfile, String name, Consumer<Throwable> onFailure) {
+        if (loginProfile == null) {
+            return false;
+        }
+
+        try {
+            Field field = propertiesField(loginProfile);
+            Object existing = field.get(loginProfile);
+            int length = existing == null ? 0 : Array.getLength(existing);
+
+            int kept = 0;
+            for (int i = 0; i < length; i++) {
+                if (!name.equals(propertyName(Array.get(existing, i)))) {
+                    kept++;
+                }
+            }
+            if (kept == length) {
+                return true;
+            }
+
+            Object updated = Array.newInstance(field.getType().getComponentType(), kept);
+            int index = 0;
+            for (int i = 0; i < length; i++) {
+                Object property = Array.get(existing, i);
+                if (!name.equals(propertyName(property))) {
+                    Array.set(updated, index++, property);
+                }
+            }
             field.set(loginProfile, updated);
             return true;
         } catch (ReflectiveOperationException | LinkageError | RuntimeException failure) {

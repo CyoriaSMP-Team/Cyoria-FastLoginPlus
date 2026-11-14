@@ -1,9 +1,3 @@
-# dev
-.worktrees/
-.playwright-mcp/
-local-docs/
-dev_web_server.py
-
 # Eclipse
 .classpath
 .project
@@ -35,6 +29,8 @@ gradle-app.setting
 
 # Build artifacts
 build/
+fabric/**/run/
+fabric/**/logs/
 bin/
 dist/
 manifest.mf
@@ -62,8 +58,3 @@ desktop.ini
 !bukkit/lib/*.jar
 !bungee/lib/*.jar
 !folia/lib/*.jar
-
-# AI agent
-AGENTS.md
-.hermes/
-.pi/

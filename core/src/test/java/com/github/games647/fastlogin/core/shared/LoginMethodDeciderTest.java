@@ -1,0 +1,183 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
+ */
+package com.github.games647.fastlogin.core.shared;
+
+import com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState;
+import com.github.games647.fastlogin.core.shared.LoginMethodDecider.Outcome;
+import com.github.games647.fastlogin.protocol.IdentityClaim.Consent;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Pins the decision table row by row, including the three-state consent (an
+ * unknown one never unlocks a password account) and auth-plugin premium
+ * accounts counting as consent.
+ */
+class LoginMethodDeciderTest {
+
+    @Test
+    void verifiedPremiumWithoutAccountAutoRegisters() {
+        assertEquals(Outcome.AUTO_REGISTER_LOGIN,
+                LoginMethodDecider.decide(true, AccountState.NONE, Consent.UNKNOWN));
+        assertEquals(Outcome.AUTO_REGISTER_LOGIN,
+                LoginMethodDecider.decide(true, AccountState.NONE, Consent.YES));
+    }
+
+    @Test
+    void verifiedPremiumWithConsentLogsIn() {
+        assertEquals(Outcome.AUTO_LOGIN,
+                LoginMethodDecider.decide(true, AccountState.PASSWORD_ACCOUNT, Consent.YES));
+    }
+
+    @Test
+    void verifiedPremiumOntoPasswordAccountKeepsPasswordLogin() {
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(true, AccountState.PASSWORD_ACCOUNT, Consent.NO));
+    }
+
+    @Test
+    void convertedAccountCountsAsConsentForEveryVerifiedReconnect() {
+        for (Consent consent : Consent.values()) {
+            assertEquals(Outcome.AUTO_LOGIN,
+                    LoginMethodDecider.decide(true, AccountState.PREMIUM_OWNED, consent));
+            assertEquals(Outcome.REJECT,
+                    LoginMethodDecider.decide(false, AccountState.PREMIUM_OWNED, consent));
+        }
+    }
+
+    @Test
+    void unverifiedOntoPasswordAccountStaysBehindThePassword() {
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.PASSWORD_ACCOUNT, Consent.NO));
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.PASSWORD_ACCOUNT, Consent.UNKNOWN));
+    }
+
+    @Test
+    void unverifiedOntoConsentedPremiumAccountIsRejected() {
+        // the symmetric row: an unverified connection cannot use a consented name
+        assertEquals(Outcome.REJECT,
+                LoginMethodDecider.decide(false, AccountState.PASSWORD_ACCOUNT, Consent.YES));
+    }
+
+    @Test
+    void unverifiedNewNameGoesToRegistration() {
+        assertEquals(Outcome.GUIDE_REGISTER,
+                LoginMethodDecider.decide(false, AccountState.NONE, Consent.UNKNOWN));
+    }
+
+    @Test
+    void unknownConsentNeverUnlocksAnything() {
+        // three-state consent: facts that never arrived keep the password lock
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(true, AccountState.PASSWORD_ACCOUNT, Consent.UNKNOWN));
+    }
+
+    @Test
+    void unreadableAccountFailsClosedToThePasswordLock() {
+        // never passwordless on an account state that could not be read
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(true, AccountState.READ_FAILURE, Consent.YES));
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.READ_FAILURE, Consent.NO));
+    }
+
+    @Test
+    void autoLoginOffKeepsUnconvertedAccountsOnThePasswordFlow() {
+        // the policy prevents new claiming/registration, not established ownership.
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(true, AccountState.PASSWORD_ACCOUNT, Consent.YES, false));
+        assertEquals(Outcome.GUIDE_REGISTER,
+                LoginMethodDecider.decide(true, AccountState.NONE, Consent.UNKNOWN, false));
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.PASSWORD_ACCOUNT, Consent.YES, false));
+    }
+
+    @Test
+    void policyOffMatrixPreservesOwnershipAndReadFailureBeforePolicy() {
+        for (Consent consent : Consent.values()) {
+            for (boolean autoRegister : new boolean[]{false, true}) {
+                for (boolean verified : new boolean[]{false, true}) {
+                    assertEquals(verified ? Outcome.PASSWORD : Outcome.REJECT,
+                            LoginMethodDecider.decide(verified, AccountState.PREMIUM_OWNED,
+                                    consent, false, autoRegister));
+                    assertEquals(Outcome.PASSWORD, LoginMethodDecider.decide(verified,
+                            AccountState.PASSWORD_ACCOUNT, consent, false, autoRegister));
+                    assertEquals(Outcome.GUIDE_REGISTER, LoginMethodDecider.decide(verified,
+                            AccountState.NONE, consent, false, autoRegister));
+                    assertEquals(Outcome.PASSWORD, LoginMethodDecider.decide(verified,
+                            AccountState.READ_FAILURE, consent, false, autoRegister));
+                }
+            }
+        }
+    }
+
+    @Test
+    void undeclaredFactsFromAnOldProxyStayConservative() {
+        // a proxy that predates the facts declares nothing: the consent is
+        // UNKNOWN, which never unlocks a password account (and a name without an
+        // account has no ownership question either)
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(true, AccountState.PASSWORD_ACCOUNT, Consent.UNKNOWN));
+        assertEquals(Outcome.AUTO_REGISTER_LOGIN,
+                LoginMethodDecider.decide(true, AccountState.NONE, Consent.UNKNOWN));
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.PASSWORD_ACCOUNT, Consent.UNKNOWN));
+    }
+
+    @Test
+    void declaredPolicyNeverReadsTheLocalCopy() {
+        // behind a proxy the declared value is the authority;
+        // config.yml marks this server's local copy "ignored here", and the
+        // supplier proves the local key is not even read
+        assertTrue(LoginMethodDecider.resolvePolicyValue(true, true, LoginMethodDeciderTest::localKeyTouched));
+        assertFalse(LoginMethodDecider.resolvePolicyValue(true, false, LoginMethodDeciderTest::localKeyTouched));
+    }
+
+    @Test
+    void undeclaredPolicyFallsBackToTheLocalCopy() {
+        // rolling upgrade: an older proxy that never declared the policy block
+        // keeps the pre-decision behaviour from the local key
+        assertTrue(LoginMethodDecider.resolvePolicyValue(false, false, () -> true));
+        assertFalse(LoginMethodDecider.resolvePolicyValue(false, true, () -> false));
+    }
+
+    private static boolean localKeyTouched() {
+        throw new AssertionError("the local policy key must not be read when a proxy declared the value");
+    }
+
+    @Test
+    void autoRegisterUnknownGatesTheAutoRegisterCell() {
+        // "verified premium + no local account" — on (default) the
+        // account is auto-created for the proven identity, off the player gets
+        // the register dialog instead
+        assertEquals(Outcome.AUTO_REGISTER_LOGIN,
+                LoginMethodDecider.decide(true, AccountState.NONE, Consent.YES, true, true));
+        assertEquals(Outcome.GUIDE_REGISTER,
+                LoginMethodDecider.decide(true, AccountState.NONE, Consent.YES, true, false));
+    }
+
+    @Test
+    void autoRegisterUnknownGatesTheAutoRegisterCellEvenForConsentedNames() {
+        // the cell is about creating the account, not about the consent
+        assertEquals(Outcome.GUIDE_REGISTER,
+                LoginMethodDecider.decide(true, AccountState.NONE, Consent.NO, true, false));
+    }
+
+    @Test
+    void authPluginPremiumAccountCountsAsConsent() {
+        // an account the auth plugin itself established as premium is
+        // trusted as an upgrade consent
+        assertEquals(Outcome.AUTO_LOGIN,
+                LoginMethodDecider.decide(true, AccountState.PREMIUM_OWNED, Consent.UNKNOWN));
+        assertEquals(Outcome.REJECT,
+                LoginMethodDecider.decide(false, AccountState.PREMIUM_OWNED, Consent.UNKNOWN));
+    }
+}

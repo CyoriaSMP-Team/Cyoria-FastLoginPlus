@@ -1,34 +1,14 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bungee.task;
 
 import com.github.games647.fastlogin.bungee.BungeeLoginSession;
 import com.github.games647.fastlogin.bungee.FastLoginBungee;
 import com.github.games647.fastlogin.bungee.event.BungeeFastLoginAutoLoginEvent;
-import com.github.games647.fastlogin.core.message.ChannelMessage;
 import com.github.games647.fastlogin.core.message.LoginActionMessage;
 import com.github.games647.fastlogin.core.message.LoginActionMessage.Type;
 import com.github.games647.fastlogin.core.shared.FastLoginCore;
@@ -38,6 +18,7 @@ import com.github.games647.fastlogin.core.shared.event.FastLoginAutoLoginEvent;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
 import net.md_5.bungee.api.CommandSender;
 import net.md_5.bungee.api.ProxyServer;
+import net.md_5.bungee.api.chat.TextComponent;
 import net.md_5.bungee.api.connection.ProxiedPlayer;
 import net.md_5.bungee.api.connection.Server;
 
@@ -75,6 +56,10 @@ public class ForceLoginTask
 
         if (!isOnlineMode()) {
             session.setAlreadySaved(true);
+            if (session.getIdentityDecision()
+                    == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE && isOnline(player)) {
+                sendDeclaration(Type.CRACKED, session);
+            }
         }
     }
 
@@ -86,6 +71,15 @@ public class ForceLoginTask
 
         session.setAlreadyLogged(true);
         return super.forceLogin(player);
+    }
+
+    @Override
+    protected void notifySameNameCracked(StoredProfile profile) {
+        if (!profile.isSameNameCracked()) {
+            core.consumeSameNameCrackedNotice(getName(player));
+            return;
+        }
+        core.getPlugin().getCrackedNoticeDelivery().deliver(player, server);
     }
 
     @Override
@@ -106,14 +100,34 @@ public class ForceLoginTask
         if (session.needsRegistration()) {
             type = Type.REGISTER;
         }
+        sendDeclaration(type, session);
+    }
 
+    private void sendDeclaration(Type type, LoginSession session) {
+        session.computeFacts(core);
+        if (type != Type.CRACKED && !session.getFacts().autoLogin()) {
+            // The unchanged profile claim still carries identity and policy. Old backends must see no force intent.
+            if (core.isDebug()) {
+                core.getPlugin().getLog().info("Not sending force {} for {}: proxy auto-login policy is disabled",
+                        type, player.getName());
+            }
+            return;
+        }
         UUID proxyId = UUID.fromString(ProxyServer.getInstance().getConfig().getUuid());
         // also hand over the Mojang UUID verified at LoginEvent. The backend needs it
         // to stamp AuthMe's premium_uuid when premiumUuid:false, where the forwarded connection
         // UUID is deliberately the offline one and therefore carries no premium signal at all.
         // Null when this connection was not verified as premium.
-        ChannelMessage loginMessage = new LoginActionMessage(type, player.getName(), proxyId,
-                session.getUuid());
+        // The trailing facts are the proxy's observations plus the recorded upgrade
+        // consent; the backend decides the login method from them.
+        UUID verified = type == Type.CRACKED ? null : session.getUuid();
+        LoginActionMessage loginMessage = new LoginActionMessage(type, player.getName(), proxyId, verified);
+        loginMessage.setFacts(session.getFacts());
+        loginMessage.setDeclaration(type == Type.CRACKED
+                ? com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE
+                : verified == null ? com.github.games647.fastlogin.protocol.IdentityClaim.Decision.UNDECIDED
+                : com.github.games647.fastlogin.protocol.IdentityClaim.Decision.PREMIUM_VERIFIED,
+                player.getUniqueId(), session.isBedrockVerified());
 
         core.getPlugin().sendPluginMessage(server, loginMessage);
     }
@@ -121,6 +135,11 @@ public class ForceLoginTask
     @Override
     public String getName(ProxiedPlayer player) {
         return player.getName();
+    }
+
+    @Override
+    public void denyLogin(ProxiedPlayer player, String message) {
+        player.disconnect(TextComponent.fromLegacyText(message));
     }
 
     @Override

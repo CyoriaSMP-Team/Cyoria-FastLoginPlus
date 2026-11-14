@@ -38,15 +38,22 @@ import com.github.games647.fastlogin.core.shared.event.FastLoginPreLoginEvent;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
-import org.bukkit.event.EventHandler;
+import org.bukkit.event.Event;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import protocolsupport.api.events.ConnectionCloseEvent;
-import protocolsupport.api.events.PlayerLoginStartEvent;
-import protocolsupport.api.events.PlayerProfileCompleteEvent;
+import org.bukkit.plugin.PluginManager;
 
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.util.Optional;
+import java.util.UUID;
 
+/**
+ * ProtocolSupport hook without a compile-time ProtocolSupport dependency.
+ * Event classes are resolved reflectively at registration so this fork builds
+ * without the unmaintained JitPack artifact. Missing or drifted API skips
+ * the hook with a warning instead of breaking startup.
+ */
 public class ProtocolSupportListener extends JoinManagement<Player, CommandSender, ProtocolLoginSource>
         implements Listener {
 
@@ -60,19 +67,101 @@ public class ProtocolSupportListener extends JoinManagement<Player, CommandSende
         this.antiBotService = antiBotService;
     }
 
-    @EventHandler
-    public void onLoginStart(PlayerLoginStartEvent loginStartEvent) {
-        if (loginStartEvent.isLoginDenied() || plugin.getCore().getAuthPluginHook() == null) {
+    public static void register(FastLoginBukkit plugin, AntiBotService antiBotService) {
+        Class<?> loginStartClass;
+        Class<?> connectionCloseClass;
+        Class<?> profileCompleteClass;
+        try {
+            loginStartClass = Class.forName("protocolsupport.api.events.PlayerLoginStartEvent");
+            connectionCloseClass = Class.forName("protocolsupport.api.events.ConnectionCloseEvent");
+            profileCompleteClass = Class.forName("protocolsupport.api.events.PlayerProfileCompleteEvent");
+            // Fail fast on API drift while the cause is still obvious.
+            loginStartClass.getMethod("isLoginDenied");
+            loginStartClass.getMethod("getConnection");
+            loginStartClass.getMethod("denyLogin", String.class);
+            loginStartClass.getMethod("setOnlineMode", boolean.class);
+            connectionCloseClass.getMethod("getConnection");
+            profileCompleteClass.getMethod("getConnection");
+            profileCompleteClass.getMethod("getForcedName");
+            profileCompleteClass.getMethod("setForcedUUID", UUID.class);
+        } catch (ClassNotFoundException | NoSuchMethodException ex) {
+            plugin.getLog().warn("ProtocolSupport hook skipped (API not present): " + ex.getMessage());
+            return;
+        }
+        ProtocolSupportListener listener = new ProtocolSupportListener(plugin, antiBotService);
+        PluginManager pluginManager = plugin.getServer().getPluginManager();
+        pluginManager.registerEvent(asEventClass(loginStartClass), listener, EventPriority.NORMAL,
+                (l, event) -> listener.onLoginStart(event), plugin);
+        pluginManager.registerEvent(asEventClass(connectionCloseClass), listener, EventPriority.NORMAL,
+                (l, event) -> listener.onConnectionClosed(event), plugin);
+        pluginManager.registerEvent(asEventClass(profileCompleteClass), listener, EventPriority.NORMAL,
+                (l, event) -> listener.onPropertiesResolve(event), plugin);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Class<? extends Event> asEventClass(Class<?> eventClass) {
+        return (Class<? extends Event>) eventClass;
+    }
+
+    private static Object invoke(Object target, String method, Object... args) {
+        try {
+            Class<?>[] params = new Class<?>[args.length];
+            for (int i = 0; i < args.length; i++) {
+                params[i] = args[i].getClass();
+            }
+            // boolean.class never appears here (all reflective args are objects);
+            // primitives are resolved by exact name lookup below.
+            Method found = findMethod(target.getClass(), method, args);
+            return found.invoke(target, args);
+        } catch (ReflectiveOperationException ex) {
+            throw new IllegalStateException("ProtocolSupport call failed: " + method, ex);
+        }
+    }
+
+    private static Method findMethod(Class<?> type, String name, Object[] args) throws NoSuchMethodException {
+        outer:
+        for (Method candidate : type.getMethods()) {
+            if (!candidate.getName().equals(name) || candidate.getParameterCount() != args.length) {
+                continue;
+            }
+            Class<?>[] params = candidate.getParameterTypes();
+            for (int i = 0; i < args.length; i++) {
+                if (args[i] == null || !params[i].isInstance(args[i])) {
+                    continue outer;
+                }
+            }
+            return candidate;
+        }
+        throw new NoSuchMethodException(type.getName() + '#' + name);
+    }
+
+    private static Object connectionOf(Object event) {
+        return invoke(event, "getConnection");
+    }
+
+    private static String profileName(Object connection) {
+        return (String) invoke(invoke(connection, "getProfile"), "getName");
+    }
+
+    private static InetSocketAddress rawAddress(Object connection) {
+        return (InetSocketAddress) invoke(connection, "getRawAddress");
+    }
+
+    public void onLoginStart(Object loginStartEvent) {
+        if ((boolean) invoke(loginStartEvent, "isLoginDenied")
+                || plugin.getCore().getAuthPluginHook() == null) {
             return;
         }
 
-        String username = loginStartEvent.getConnection().getProfile().getName();
-        InetSocketAddress address = loginStartEvent.getConnection().getRawAddress();
+        Object connection = connectionOf(loginStartEvent);
+        String username = profileName(connection);
+        InetSocketAddress address = rawAddress(connection);
         plugin.getLog().info("Incoming login request for {} from {}", username, address);
 
         Action action = antiBotService.onIncomingConnection(address, username);
         if (action != Action.Continue) {
-            BukkitFastLoginAntiBotEvent antiBotEvent = new BukkitFastLoginAntiBotEvent(address, username, action);
+            BukkitFastLoginAntiBotEvent antiBotEvent =
+                    new BukkitFastLoginAntiBotEvent(address, username, action);
             plugin.getServer().getPluginManager().callEvent(antiBotEvent);
             if (antiBotEvent.isCancelled()) {
                 action = Action.Continue;
@@ -80,48 +169,49 @@ public class ProtocolSupportListener extends JoinManagement<Player, CommandSende
         }
 
         switch (action) {
-            case Ignore:
-                // just ignore
-                return;
             case Block:
                 String message = plugin.getCore().getMessage("kick-antibot");
-                loginStartEvent.denyLogin(message);
+                invoke(loginStartEvent, "denyLogin", message);
                 break;
             case Continue:
             default:
                 //remove old data every time on a new login in order to keep the session only for one person
                 plugin.removeSession(address);
 
-                ProtocolLoginSource source = new ProtocolLoginSource(loginStartEvent);
-                super.onLogin(username, source);
+                try {
+                    ProtocolLoginSource source = new ProtocolLoginSource(loginStartEvent);
+                    super.onLogin(username, source);
+                } catch (ReflectiveOperationException ex) {
+                    plugin.getLog().warn("ProtocolSupport login source unavailable: " + ex.getMessage());
+                }
                 break;
         }
     }
 
-    @EventHandler
-    public void onConnectionClosed(ConnectionCloseEvent closeEvent) {
-        InetSocketAddress address = closeEvent.getConnection().getRawAddress();
+    public void onConnectionClosed(Object closeEvent) {
+        InetSocketAddress address = rawAddress(connectionOf(closeEvent));
         plugin.removeSession(address);
     }
 
-    @EventHandler
-    public void onPropertiesResolve(PlayerProfileCompleteEvent profileCompleteEvent) {
-        InetSocketAddress address = profileCompleteEvent.getConnection().getRawAddress();
+    public void onPropertiesResolve(Object profileCompleteEvent) {
+        Object connection = connectionOf(profileCompleteEvent);
+        InetSocketAddress address = rawAddress(connection);
 
         BukkitLoginSession session = plugin.getSession(address);
 
-        if (session != null && profileCompleteEvent.getConnection().getProfile().isOnlineMode()) {
+        Object profile = invoke(connection, "getProfile");
+        if (session != null && (boolean) invoke(profile, "isOnlineMode")) {
             session.setVerifiedPremium(true);
             // Same reason as the proxy paths: carry the verified Mojang UUID into the session.
             // ProtocolSupport applies the offline rewrite below to this very profile object once
             // the event returns, so afterwards neither resolvePremiumUuid source is v4 and AuthMe
             // would never get a premium_uuid written.
-            session.setUuid(profileCompleteEvent.getConnection().getProfile().getUUID());
+            session.setUuid((UUID) invoke(profile, "getUUID"));
 
             if (!plugin.getConfig().getBoolean("premiumUuid")) {
-                String username = Optional.ofNullable(profileCompleteEvent.getForcedName())
-                        .orElse(profileCompleteEvent.getConnection().getProfile().getName());
-                profileCompleteEvent.setForcedUUID(UUIDAdapter.generateOfflineId(username));
+                String username = Optional.ofNullable((String) invoke(profileCompleteEvent, "getForcedName"))
+                        .orElse((String) invoke(profile, "getName"));
+                invoke(profileCompleteEvent, "setForcedUUID", UUIDAdapter.generateOfflineId(username));
             }
         }
     }
@@ -138,9 +228,6 @@ public class ProtocolSupportListener extends JoinManagement<Player, CommandSende
     public void requestPremiumLogin(ProtocolLoginSource source, StoredProfile profile, String username,
                                     boolean registered) {
         source.enableOnlinemode();
-
-        String ip = source.getAddress().getAddress().getHostAddress();
-        plugin.getCore().addLoginAttempt(ip, username);
 
         BukkitLoginSession playerSession = new BukkitLoginSession(username, registered, profile);
         plugin.putSession(source.getAddress(), playerSession);

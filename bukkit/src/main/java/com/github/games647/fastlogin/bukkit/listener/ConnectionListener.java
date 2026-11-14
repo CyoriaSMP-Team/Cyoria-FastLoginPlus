@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.listener;
 
@@ -31,6 +12,7 @@ import com.github.games647.fastlogin.bukkit.task.FloodgateAuthTask;
 import com.github.games647.fastlogin.bukkit.task.ForceLoginTask;
 import com.github.games647.fastlogin.core.hooks.bedrock.FloodgateService;
 import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -59,14 +41,55 @@ public class ConnectionListener implements Listener {
     @EventHandler(priority = EventPriority.LOWEST)
     public void onPlayerLogin(PlayerLoginEvent loginEvent) {
         removeBlockedStatus(loginEvent.getPlayer());
+        String denied = plugin.takePendingKick(loginEvent.getPlayer().getName());
+        if (denied != null) {
+            // a login refused by the login-method decision during the
+            // configuration phase: kick before the player ever joins
+            loginEvent.disallow(Result.KICK_OTHER, loginKickMessage(denied));
+            return;
+        }
         if (loginEvent.getResult() == Result.ALLOWED && !plugin.isServerFullyStarted()) {
-            loginEvent.disallow(Result.KICK_OTHER, plugin.getCore().getMessage("not-started"));
+            loginEvent.disallow(Result.KICK_OTHER, loginKickMessage(plugin.getCore().getMessage("not-started")));
+        }
+        if (loginEvent.getResult() == Result.ALLOWED) {
+            Player player = loginEvent.getPlayer();
+            if (plugin.getProxyBedrockPreLogin() != null && plugin.getProxyBedrockPreLogin().inspectSpigot(player)) {
+                if (!plugin.getProxyBedrockPreLogin().isTrustedSpigot(player)) {
+                    loginEvent.disallow(Result.KICK_OTHER,
+                            loginKickMessage(plugin.getCore().getMessage("proxy-claim-required")));
+                }
+                return;
+            }
+            if (!plugin.observeSpigotIdentity("PlayerLoginEvent", loginEvent.getPlayer().getName(),
+                    loginEvent.getPlayer(), true)) {
+                loginEvent.disallow(Result.KICK_OTHER,
+                        loginKickMessage(plugin.getCore().getMessage("proxy-claim-required")));
+            }
+        }
+    }
+
+    private String loginKickMessage(String message) {
+        // Spigot treats this event's reason as literal text, including legacy color codes.
+        return plugin.isPaper() ? message : ChatColor.stripColor(message);
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onPlayerJoinWaitingHint(PlayerJoinEvent joinEvent) {
+        if (!plugin.getBungeeManager().isEnabled()) {
+            return;
+        }
+
+        Player player = joinEvent.getPlayer();
+        BukkitLoginSession session = plugin.getSession(player.spigot().getRawAddress());
+        if (session != null && !session.isFactsPresent()) {
+            plugin.getCore().sendLocaleMessage("account-state-checking", player);
         }
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onPlayerJoin(PlayerJoinEvent joinEvent) {
         Player player = joinEvent.getPlayer();
+        plugin.observeSpigotIdentity("PlayerJoinEvent", player.getName(), player, false);
 
         Bukkit.getScheduler().runTaskLater(plugin, () -> {
             delayForceLogin(player);
@@ -76,6 +99,13 @@ public class ConnectionListener implements Listener {
     }
 
     private void delayForceLogin(Player player) {
+        if (plugin.getProxyBedrockPreLogin() != null && plugin.getProxyBedrockPreLogin().isHandled(player)) {
+            plugin.getBungeeManager().markJoinEventFired(player);
+            return;
+        }
+        if (!player.isOnline() || !plugin.deliverPendingLogin(player)) {
+            return;
+        }
         // session exists so the player is ready for force login
         // cases: Paper (firing BungeeCord message before PlayerJoinEvent) or not running BungeeCord and already
         // having the login session from the login process
@@ -114,6 +144,7 @@ public class ConnectionListener implements Listener {
         Player player = quitEvent.getPlayer();
 
         removeBlockedStatus(player);
+        player.removeMetadata("flp-password-notice", plugin);
         plugin.getCore().getPendingConfirms().remove(player.getUniqueId());
         plugin.getPremiumPlayers().remove(player.getUniqueId());
         plugin.getPlayerFloodgateState().remove(player.getUniqueId());
