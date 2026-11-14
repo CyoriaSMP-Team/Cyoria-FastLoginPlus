@@ -1,31 +1,15 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.shared;
 
 import com.github.games647.fastlogin.core.storage.StoredProfile;
+import com.github.games647.fastlogin.protocol.IdentityClaim;
+import com.github.games647.fastlogin.protocol.IdentityClaim.Consent;
+import com.github.games647.fastlogin.protocol.IdentityClaim.Decision;
 
 import java.util.StringJoiner;
 import java.util.UUID;
@@ -37,6 +21,11 @@ public abstract class LoginSession {
     private final String requestUsername;
     private String username;
     private UUID uuid;
+    private Decision identityDecision = Decision.UNDECIDED;
+
+    private IdentityClaim.Facts facts = IdentityClaim.Facts.defaults();
+    private boolean factsPresent;
+    private boolean bedrockVerified;
 
     protected boolean registered;
 
@@ -102,6 +91,146 @@ public abstract class LoginSession {
         this.uuid = uuid;
     }
 
+    public synchronized Decision getIdentityDecision() {
+        return identityDecision;
+    }
+
+    /**
+     * Whether this connection was verified through Floodgate. A Bedrock identity
+     * is authenticated by Xbox Live even though it has no Mojang premium UUID.
+     *
+     * @return true for a Floodgate-verified Bedrock connection
+     */
+    public synchronized boolean isBedrockVerified() {
+        return bedrockVerified;
+    }
+
+    public synchronized void setBedrockVerified(boolean bedrockVerified) {
+        this.bedrockVerified = bedrockVerified;
+    }
+
+    public synchronized void setIdentityDecision(Decision identityDecision) {
+        this.identityDecision = java.util.Objects.requireNonNull(identityDecision, "identityDecision");
+    }
+
+    /**
+     * Computes the observation facts and the upgrade consent this connection
+     * declares to the backend. Everything here is a snapshot of the proxy's own
+     * record at login time: the record's existence, the recorded consent, the
+     * premium UUID observation and the same-name cracked observation.
+     *
+     * @param core the proxy core, for the policy keys
+     */
+    public synchronized void computeFacts(FastLoginCore<?, ?, ?> core) {
+        StoredProfile stored = profile;
+        boolean newPlayer = stored == null || !stored.isExistingPlayer();
+        Consent consent = stored != null && stored.isOnlinemodePreferred() ? Consent.YES : Consent.NO;
+        // reading the same-name cracked observation follows the configured
+        // fallback semantics: with secondAttemptCracked off the mark is
+        // dormant and the name is reported as never observed
+        boolean premiumName = stored != null
+                && (stored.getId() != null
+                || (stored.isSameNameCracked() && core.getConfig().getBoolean("secondAttemptCracked")));
+        // policy keys live on the proxy and travel with the facts
+        this.facts = new IdentityClaim.Facts(newPlayer, premiumName && uuid == null, consent,
+                core.getConfig().getBoolean("autoLogin"),
+                core.getConfig().getBoolean("auto-register-unknown"),
+                core.getConfig().getBoolean("offline-whitelist"));
+    }
+
+    /**
+     * The declared facts and policy of this connection.
+     *
+     * @return the proxy's fact bundle for this connection
+     */
+    public synchronized IdentityClaim.Facts getFacts() {
+        return facts;
+    }
+
+    /**
+     * Applies the identity facts and policy received with a login message
+     * (backend side). Marking the facts as present distinguishes "a proxy
+     * declared these" (possibly the conservative shape of an older proxy) from
+     * "no proxy at all" (standalone deployments read their own keys).
+     *
+     * @param facts the proxy's fact bundle for this connection
+     */
+    public synchronized void setFacts(IdentityClaim.Facts facts) {
+        this.facts = java.util.Objects.requireNonNull(facts, "facts");
+        this.factsPresent = true;
+    }
+
+    /**
+     * Whether a proxy declared identity facts for this connection.
+     *
+     * @return true on the message path, false in standalone deployments
+     */
+    public synchronized boolean isFactsPresent() {
+        return factsPresent;
+    }
+
+    /**
+     * Whether the proxy has no record for this name.
+     *
+     * @return true when the name is new to FastLoginPlus
+     */
+    public synchronized boolean isNewPlayer() {
+        return facts.newPlayer();
+    }
+
+    /**
+     * Whether a premium name was observed without a passing verification.
+     *
+     * @return true for the same-name cracked observation
+     */
+    public synchronized boolean isSameNameCracked() {
+        return facts.sameNameCracked();
+    }
+
+    /**
+     * The name's upgrade consent as recorded on the proxy.
+     *
+     * @return consent state, unknown when nothing was declared
+     */
+    public synchronized Consent getConsent() {
+        return facts.consent();
+    }
+
+    /**
+     * Whether auto-login for verified premium identities is enabled.
+     *
+     * @return the proxy's autoLogin value
+     */
+    public synchronized boolean isAutoLogin() {
+        return facts.autoLogin();
+    }
+
+    /**
+     * Whether verified identities without a local account are auto-registered.
+     *
+     * <p>Scope (the key name misleads — "unknown" is not "strangers/offline
+     * players"): the repair case only, for a connection Mojang has verified
+     * whose name has no account in the auth plugin (the account was deleted, or
+     * the databases drifted apart). Offline/cracked connections are never
+     * covered — they carry no identity proof and always go through the register
+     * dialog with a password the player chooses. Off = such a verified player
+     * gets the register dialog instead of an automatic account.</p>
+     *
+     * @return the policy value as declared by the proxy
+     */
+    public synchronized boolean isAutoRegisterUnknown() {
+        return facts.autoRegisterUnknown();
+    }
+
+    /**
+     * Whether unregistered new players are rejected.
+     *
+     * @return the proxy's offline-whitelist value
+     */
+    public synchronized boolean isOfflineWhitelist() {
+        return facts.offlineWhitelist();
+    }
+
     @Override
     public String toString() {
         return new StringJoiner(", ", LoginSession.class.getSimpleName() + '[', "]")
@@ -110,6 +239,8 @@ public abstract class LoginSession {
                 .add("username='" + username + '\'')
                 .add("uuid=" + uuid)
                 .add("registered=" + registered)
+                .add("identityDecision=" + identityDecision)
+                .add("facts=" + facts)
                 .toString();
     }
 }

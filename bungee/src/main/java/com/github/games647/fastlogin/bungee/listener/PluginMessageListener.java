@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bungee.listener;
 
@@ -135,8 +116,7 @@ public class PluginMessageListener implements Listener {
                         plugin.getLog().info("Premium-warning gate hit for {}: showing confirmation prompt, "
                                 + "toggle deferred until the command is issued again", playerName);
                     }
-                    String message = core.getMessage("premium-warning");
-                    forPlayer.sendMessage(TextComponent.fromLegacyText(message));
+                    core.sendLocaleMessage("premium-warning", forPlayer);
                     return;
                 }
 
@@ -162,7 +142,7 @@ public class PluginMessageListener implements Listener {
 
             String playerName = deleteMessage.getPlayerName();
             boolean isSourceInvoker = deleteMessage.isSourceInvoker();
-            plugin.getScheduler().runAsync(() -> {
+            plugin.getScheduler().runAsync(() -> core.getStorage().withNameLock(playerName, () -> {
                 StoredProfile profile = core.getStorage().loadProfile(playerName);
                 if (profile == null) {
                     // null only on SQL exception (connection down / lock timeout) — do not
@@ -192,7 +172,7 @@ public class PluginMessageListener implements Listener {
                         sendDeleteFeedback(forPlayer, isSourceInvoker, "delete-fail");
                     }
                 }
-            });
+            }));
         }
     }
 
@@ -203,6 +183,9 @@ public class PluginMessageListener implements Listener {
             carrier.sendMessage(TextComponent.fromLegacyText(message));
         } else {
             ProxyServer.getInstance().getConsole().sendMessage(TextComponent.fromLegacyText(message));
+            // For an in-game admin command the carrier is the admin, so show
+            // the final proxy result there as well as on the proxy console.
+            carrier.sendMessage(TextComponent.fromLegacyText(message));
             // mirror the delete result to the backend console that issued the
             // relayed command (over the carrier player's server connection)
             Server server = carrier.getServer();
@@ -236,8 +219,10 @@ public class PluginMessageListener implements Listener {
             // the player may have disconnected between the message
             // arriving and this async task running — nothing to persist then
             if (loginSession == null) {
-                plugin.getLog().info("No active session for {} on success message"
-                        + " — the player probably disconnected", forPlayer.getName());
+                if (plugin.getCore().isDebug()) {
+                    plugin.getLog().info("No active session for {} on success message"
+                            + " — the player probably disconnected", forPlayer.getName());
+                }
                 return;
             }
             StoredProfile playerProfile = loginSession.getProfile();
@@ -247,10 +232,35 @@ public class PluginMessageListener implements Listener {
             // interleave with a concurrent toggle for the same player; the
             // already-saved check runs inside for the same reason
             plugin.getCore().getStorage().withNameLock(forPlayer.getName(), () -> {
-                if (!loginSession.isAlreadySaved()) {
-                    playerProfile.setOnlinemodePreferred(true);
-                    plugin.getCore().getStorage().save(playerProfile);
+                if (loginSession.isAlreadySaved()) {
+                    return;
+                }
+                // re-read the current row: an admin toggle may have revoked the
+                // consent after this login started, and the stale session object
+                // must not resurrect it
+                StoredProfile current = plugin.getCore().getStorage().loadProfile(forPlayer.getName());
+                if (current != null && !current.isOnlinemodePreferred()
+                        && playerProfile.isOnlinemodePreferred()) {
                     loginSession.setAlreadySaved(true);
+                    plugin.getLog().warn("Ignoring the success ack for {}: the consent was revoked"
+                            + " during this login", forPlayer.getName());
+                    return;
+                }
+                // the backend confirmed a premium outcome (auto-register or
+                // auto-login), so the account now belongs to this verified
+                // identity — this is what the consent records ("registered as
+                // premium", including auth-plugin-created premium accounts).
+                // Write the freshly loaded row so concurrent legacy fields survive.
+                StoredProfile target = current == null ? playerProfile : current;
+                target.setOnlinemodePreferred(true);
+                target.setSameNameCracked(false);
+                // a failed write must not mark the session saved, so a later
+                // ack can retry the persist instead of silently losing it
+                if (plugin.getCore().getStorage().saveQuietly(target)) {
+                    loginSession.setAlreadySaved(true);
+                } else {
+                    plugin.getLog().warn("Could not persist premium profile for {};"
+                            + " keeping the session unsaved for the next ack", forPlayer.getName());
                 }
             });
         }

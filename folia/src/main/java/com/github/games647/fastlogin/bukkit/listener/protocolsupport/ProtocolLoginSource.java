@@ -26,34 +26,69 @@
 package com.github.games647.fastlogin.bukkit.listener.protocolsupport;
 
 import com.github.games647.fastlogin.core.shared.LoginSource;
-import protocolsupport.api.events.PlayerLoginStartEvent;
 
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 
+/**
+ * ProtocolSupport login source without a compile-time ProtocolSupport
+ * dependency. The ProtocolSupport API is resolved reflectively so this fork
+ * builds without the unmaintained JitPack artifact; behaviour is identical
+ * when ProtocolSupport is installed and the hook is simply skipped when it
+ * is absent or its API drifted.
+ */
 public class ProtocolLoginSource implements LoginSource {
 
-    private final PlayerLoginStartEvent loginStartEvent;
+    private final Object loginStartEvent;
+    private final Method setOnlineMode;
+    private final Method denyLogin;
+    private final Method getConnection;
 
-    public ProtocolLoginSource(PlayerLoginStartEvent loginStartEvent) {
+    public ProtocolLoginSource(Object loginStartEvent) throws ReflectiveOperationException {
         this.loginStartEvent = loginStartEvent;
+        Class<?> eventClass = loginStartEvent.getClass();
+        this.setOnlineMode = eventClass.getMethod("setOnlineMode", boolean.class);
+        this.denyLogin = eventClass.getMethod("denyLogin", String.class);
+        this.getConnection = eventClass.getMethod("getConnection");
+    }
+
+    private static Object invoke(Method method, Object target, Object... args) {
+        try {
+            return method.invoke(target, args);
+        } catch (ReflectiveOperationException ex) {
+            throw new IllegalStateException("ProtocolSupport call failed: " + method.getName(), ex);
+        }
+    }
+
+    private Object connection() {
+        return invoke(getConnection, loginStartEvent);
+    }
+
+    private static Object profile(Object connection) throws ReflectiveOperationException {
+        return connection.getClass().getMethod("getProfile").invoke(connection);
     }
 
     @Override
     public void enableOnlinemode() {
-        loginStartEvent.setOnlineMode(true);
+        invoke(setOnlineMode, loginStartEvent, true);
     }
 
     @Override
     public void kick(String message) {
-        loginStartEvent.denyLogin(message);
+        invoke(denyLogin, loginStartEvent, message);
     }
 
     @Override
     public InetSocketAddress getAddress() {
-        return loginStartEvent.getConnection().getRawAddress();
+        try {
+            Object connection = connection();
+            return (InetSocketAddress) connection.getClass().getMethod("getRawAddress").invoke(connection);
+        } catch (ReflectiveOperationException ex) {
+            throw new IllegalStateException("ProtocolSupport call failed: getRawAddress", ex);
+        }
     }
 
-    public PlayerLoginStartEvent getLoginStartEvent() {
+    public Object getLoginStartEvent() {
         return loginStartEvent;
     }
 

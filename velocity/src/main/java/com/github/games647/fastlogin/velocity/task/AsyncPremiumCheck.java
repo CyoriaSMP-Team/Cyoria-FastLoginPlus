@@ -1,37 +1,20 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.velocity.task;
 
 import com.github.games647.fastlogin.core.shared.JoinManagement;
 import com.github.games647.fastlogin.core.shared.event.FastLoginPreLoginEvent;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
+import com.github.games647.fastlogin.protocol.IdentityClaim.Decision;
 import com.github.games647.fastlogin.velocity.FastLoginVelocity;
 import com.github.games647.fastlogin.velocity.VelocityLoginSession;
 import com.github.games647.fastlogin.velocity.VelocityLoginSource;
 import com.github.games647.fastlogin.velocity.event.VelocityFastLoginPreLoginEvent;
+import com.github.games647.fastlogin.velocity.listener.VerificationCloseWatcher;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.proxy.InboundConnection;
@@ -60,8 +43,12 @@ public class AsyncPremiumCheck extends JoinManagement<Player, CommandSource, Vel
 
     @Override
     public void run() {
+        if (!preLoginEvent.getResult().isAllowed()) {
+            return;
+        }
         plugin.getSession().remove(connection.getRemoteAddress());
-        super.onLogin(username, new VelocityLoginSource(connection, preLoginEvent));
+        VelocityLoginSource source = new VelocityLoginSource(connection, preLoginEvent);
+        super.onLogin(username, source);
     }
 
     @Override
@@ -75,27 +62,28 @@ public class AsyncPremiumCheck extends JoinManagement<Player, CommandSource, Vel
             return plugin.getProxy().getEventManager().fire(event).get(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt(); // Restore the interrupt flag
-            return event;
+            throw new IllegalStateException("Interrupted before FLP login decision", e);
         } catch (ExecutionException | TimeoutException e) {
-            core.getPlugin().getLog().error("Error firing event", e);
-            return event;
+            throw new IllegalStateException("FLP pre-login event did not complete", e);
         }
     }
 
     @Override
     public void requestPremiumLogin(VelocityLoginSource source, StoredProfile profile,
                                     String username, boolean registered) {
-        source.enableOnlinemode();
         VelocityLoginSession session = new VelocityLoginSession(username, registered, profile);
         plugin.getSession().put(source.getConnection().getRemoteAddress(), session);
 
-        String ip = source.getAddress().getAddress().getHostAddress();
-        plugin.getCore().addLoginAttempt(ip, username);
+        plugin.getCore().markPendingVerification(username, source.getConnection());
+        VerificationCloseWatcher.attach(plugin, username, source.getConnection());
+        source.enableOnlinemode();
     }
 
     @Override
     public void startCrackedSession(VelocityLoginSource source, StoredProfile profile, String username) {
         VelocityLoginSession session = new VelocityLoginSession(username, false, profile);
+        session.setIdentityDecision(Decision.OFFLINE);
         plugin.getSession().put(source.getConnection().getRemoteAddress(), session);
+        source.enableOfflinemode();
     }
 }

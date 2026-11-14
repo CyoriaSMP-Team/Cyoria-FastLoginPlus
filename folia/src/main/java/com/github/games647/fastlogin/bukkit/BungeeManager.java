@@ -1,33 +1,13 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
@@ -62,11 +42,13 @@ public class BungeeManager {
     private static final String LEGACY_FILE_NAME = "proxy-whitelist.txt";
     private static final String FILE_NAME = "allowed-proxies.txt";
 
-    //null if proxies allowed list is empty so bungeecord support is disabled
+    // Null before initialization; an empty allowlist never authenticates proxy messages.
     private Set<UUID> proxyIds;
 
     private final FastLoginBukkit plugin;
     private boolean enabled;
+    private boolean signedForwarding;
+    private boolean initialized;
 
     private final Collection<UUID> firedJoinEvents = new HashSet<>();
 
@@ -121,10 +103,16 @@ public class BungeeManager {
     }
 
     public void initialize() {
+        if (initialized) {
+            return;
+        }
+        initialized = true;
         enabled = detectProxy();
 
         if (enabled) {
             proxyIds = loadBungeeCordIds();
+            plugin.getLog().info("Loaded {} proxy IDs from allowed-proxies.txt. "
+                    + "Changing this file requires a backend restart.", proxyIds.size());
             if (proxyIds.isEmpty()) {
                 // an empty or unparsable allowed-proxies.txt makes
                 // every incoming proxy ID untrusted — surface this at ERROR
@@ -132,6 +120,7 @@ public class BungeeManager {
                 plugin.getLog().error("allowed-proxies.txt contains no valid proxy IDs"
                         + " — proxy (BungeeCord/Velocity) support cannot work."
                         + " Add the proxy ID printed by the proxy plugin to the file.");
+                warnIfUntrustedLegacy(isSignedForwarding(), plugin.getLog());
             }
 
             registerPluginChannels();
@@ -142,14 +131,22 @@ public class BungeeManager {
         }
     }
 
-    private boolean isProxySupported(String className, String fieldName)
+    // Called only after startup loaded an empty effective proxy allowlist.
+    static void warnIfUntrustedLegacy(boolean signedForwarding, org.slf4j.Logger logger) {
+        if (!signedForwarding) {
+            logger.warn("Legacy proxy forwarding is unsigned and allowed-proxies.txt has no "
+                    + "valid proxy IDs. The backend port must be reachable only by your proxy; "
+                    + "otherwise direct connections can impersonate players. Proxy IDs are sent in "
+                    + "plaintext and do not replace backend network isolation.");
+        }
+    }
+
+    boolean isProxySupported(String className, String fieldName)
         throws ClassNotFoundException, NoSuchFieldException, IllegalAccessException {
         return Class.forName(className).getDeclaredField(fieldName).getBoolean(null);
     }
 
-    private boolean isVelocityEnabled()
-        throws NoSuchFieldException, IllegalArgumentException, IllegalAccessException, ClassNotFoundException,
-        NoSuchMethodException, InvocationTargetException {
+    boolean isVelocityEnabled() throws ReflectiveOperationException {
         try {
             Class<?> globalConfig = Class.forName("io.papermc.paper.configuration.GlobalConfiguration");
             Object global = globalConfig.getDeclaredMethod("get").invoke(null);
@@ -161,35 +158,61 @@ public class BungeeManager {
             return velocityConfig.getClass().getDeclaredField("enabled").getBoolean(velocityConfig);
         } catch (ClassNotFoundException classNotFoundException) {
             // try again using the older Paper configuration, because the old class file still exists in newer versions
-            if (isProxySupported("com.destroystokyo.paper.PaperConfig", "velocitySupport")) {
-                return true;
+            try {
+                return isProxySupported("com.destroystokyo.paper.PaperConfig", "velocitySupport");
+            } catch (ClassNotFoundException spigot) {
+                // Paper-only configuration classes are normally absent on Spigot.
+                return false;
             }
         }
+    }
 
-        return false;
+    /**
+     * Whether the forwarded profile attributes arrive over a signature-protected
+     * channel (Velocity modern forwarding signs the whole forwarding payload with
+     * the shared secret). Legacy forwarding (BungeeCord) carries unsigned
+     * attributes, so their claims need an HMAC keyed by an allowed proxy UUID instead.
+     *
+     * <p>Both mechanisms enabled at once (a migration or a misconfiguration) is
+     * handled as the legacy chain, the stricter side: only signature-protected
+     * forwarding may skip the claim HMAC check.</p>
+     *
+     * @return true when forwarded attributes are signature-protected
+     */
+    public boolean isSignedForwarding() {
+        return signedForwarding;
     }
 
     private boolean detectProxy() {
+        boolean bungeeEnabled = false;
+        boolean legacyKnown = false;
+        boolean velocityEnabled = false;
+        Exception failure = null;
         try {
-            if (isProxySupported("org.spigotmc.SpigotConfig", "bungee")) {
-                return true;
+            bungeeEnabled = isProxySupported("org.spigotmc.SpigotConfig", "bungee");
+            legacyKnown = true;
+        } catch (ClassNotFoundException classNotFoundException) {
+            // No supported legacy forwarding configuration is available.
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            failure = ex;
+        }
+
+        try {
+            velocityEnabled = isVelocityEnabled();
+        } catch (ClassNotFoundException classNotFoundException) {
+            // Missing Paper classes are expected on Spigot.
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            if (failure == null) {
+                failure = ex;
             }
-        } catch (ClassNotFoundException classNotFoundException) {
-            // leave stacktrace for class not found out
-            plugin.getLog().warn("Cannot check for BungeeCord support: {}", classNotFoundException.getMessage());
-        } catch (NoSuchFieldException | IllegalAccessException ex) {
-            plugin.getLog().warn("Cannot check for BungeeCord support", ex);
         }
 
-        try {
-            return isVelocityEnabled();
-        } catch (ClassNotFoundException classNotFoundException) {
-            plugin.getLog().warn("Cannot check for Velocity support in Paper: {}", classNotFoundException.getMessage());
-        } catch (NoSuchFieldException | IllegalAccessException | NoSuchMethodException | InvocationTargetException ex) {
-            plugin.getLog().warn("Cannot check for Velocity support in Paper", ex);
+        if (failure != null) {
+            plugin.getLog().warn("Cannot check the proxy forwarding setup; using strict legacy claim validation",
+                    failure);
         }
-
-        return false;
+        signedForwarding = velocityEnabled && legacyKnown && !bungeeEnabled;
+        return bungeeEnabled || velocityEnabled;
     }
 
     private void registerPluginChannels() {
@@ -242,6 +265,15 @@ public class BungeeManager {
 
     public boolean isProxyAllowed(UUID proxyId) {
         return proxyIds != null && proxyIds.contains(proxyId);
+    }
+
+    /**
+     * Returns the existing proxy allowlist without exposing a mutable collection.
+     *
+     * @return allowed proxy UUIDs, or an empty set before initialization
+     */
+    public Set<UUID> getAllowedProxyIds() {
+        return proxyIds == null ? Collections.emptySet() : Collections.unmodifiableSet(proxyIds);
     }
 
     /**

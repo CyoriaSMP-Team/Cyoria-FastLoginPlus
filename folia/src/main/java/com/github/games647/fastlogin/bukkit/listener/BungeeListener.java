@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.listener;
 
@@ -59,7 +40,12 @@ public class BungeeListener implements PluginMessageListener {
         ByteArrayDataInput dataInput = ByteStreams.newDataInput(message);
 
         LoginActionMessage loginMessage = new LoginActionMessage();
-        loginMessage.readFrom(dataInput);
+        try {
+            loginMessage.readFrom(dataInput);
+        } catch (IllegalArgumentException | IllegalStateException malformed) {
+            plugin.getLog().warn("Ignoring malformed identity declaration", malformed);
+            return;
+        }
 
         if (plugin.getCore().isDebug()) {
             plugin.getLog().info("Received plugin message {}", loginMessage);
@@ -74,6 +60,40 @@ public class BungeeListener implements PluginMessageListener {
             plugin.getLog().warn("Force action player {} not found", loginMessage.getPlayerName());
             return;
         }
+        if (loginMessage.getForwardedUuid() != null
+                && !loginMessage.getForwardedUuid().equals(targetPlayer.getUniqueId())) {
+            plugin.getLog().warn("Ignoring identity declaration for {}: forwarded connection UUID mismatch",
+                    loginMessage.getPlayerName());
+            return;
+        }
+
+        UUID sourceId = loginMessage.getProxyId();
+        if (!plugin.getBungeeManager().isProxyAllowed(sourceId)) {
+            plugin.getLog().warn("Received proxy id: {} that doesn't exist in the proxy file", sourceId);
+            return;
+        }
+        // Declaration ownership includes denied/invalid/unsupported attempts, not just accepted logins.
+        if (loginMessage.getType() != Type.CRACKED && isBackendFloodgateLoginHandled(targetPlayer)) {
+            if (plugin.getCore().isDebug()) {
+                plugin.getLog().info("Ignoring late proxy action {} for backend-handled Bedrock player {}",
+                        loginMessage.getType(), targetPlayer.getName());
+            }
+            return;
+        }
+        // If the earlier live-profile claim was unavailable, an already authenticated carrier
+        // can deliver the first policy fact. That late fallback only protects later connections.
+        plugin.synchronizeAuthMePremiumPolicy(loginMessage.getFacts());
+        if (loginMessage.getType() != Type.CRACKED) {
+            if (loginMessage.getFacts().policyDeclared() && !loginMessage.isAutoLogin()) {
+                plugin.getLog().warn("Proxy force {} for {} contradicts its disabled auto-login policy; "
+                        + "applying declared policy instead", loginMessage.getType(), loginMessage.getPlayerName());
+            } else if (!loginMessage.getFacts().policyDeclared()) {
+                plugin.getLog().warn("Ignoring proxy force {} for {}: policy facts are missing; "
+                        + "keeping the auth plugin's own login flow",
+                        loginMessage.getType(), loginMessage.getPlayerName());
+                return;
+            }
+        }
 
         // A player who is already authenticated is the normal case here, not a fault: on a Paper
         // backend the configure phase logs premium players in before the proxy's own message can
@@ -87,13 +107,22 @@ public class BungeeListener implements PluginMessageListener {
                         loginMessage, targetPlayer);
             }
         } else {
-            UUID sourceId = loginMessage.getProxyId();
-            if (plugin.getBungeeManager().isProxyAllowed(sourceId)) {
-                readMessage(targetPlayer, loginMessage);
-            } else {
-                plugin.getLog().warn("Received proxy id: {} that doesn't exist in the proxy file", sourceId);
-            }
+            readMessage(targetPlayer, loginMessage);
         }
+    }
+
+    /**
+     * Whether a declaration owns this connection, or backend Floodgate already requested login.
+     * Ownership also suppresses actions when authentication was denied or unsupported.
+     *
+     * @param player the message's target player
+     * @return true when alternatives must not override this connection's Bedrock decision
+     */
+    boolean isBackendFloodgateLoginHandled(Player player) {
+        if (plugin.getProxyBedrockPreLogin() != null && plugin.getProxyBedrockPreLogin().isHandled(player)) {
+            return true;
+        }
+        return plugin.hasBackendFloodgate() && FloodgatePreLoginListener.isHandled(plugin, player);
     }
 
     private void readMessage(Player player, LoginActionMessage message) {
@@ -103,36 +132,54 @@ public class BungeeListener implements PluginMessageListener {
         if (plugin.getCore().isDebug()) {
             plugin.getLog().info("Player info {} command for {} from proxy", type, playerName);
         }
-        if (type == Type.LOGIN) {
-            onLoginMessage(player, playerName, message.getVerifiedPremiumUuid());
+        if (type != Type.CRACKED && message.getFacts().policyDeclared() && !message.isAutoLogin()) {
+            // REGISTER must also reach the policy decision for existing password accounts.
+            onLoginMessage(player, playerName, message);
+        } else if (type == Type.LOGIN) {
+            onLoginMessage(player, playerName, message);
         } else if (type == Type.REGISTER) {
-            onRegisterMessage(player, playerName, message.getVerifiedPremiumUuid());
+            onRegisterMessage(player, playerName, message);
         } else if (type == Type.CRACKED) {
-            //we don't start a force login task here so update it manually
             plugin.getPremiumPlayers().put(player.getUniqueId(), PremiumStatus.CRACKED);
+            BukkitLoginSession session = new BukkitLoginSession(playerName, false);
+            session.setConnectionUuid(player.getUniqueId());
+            session.setFacts(message.getFacts());
+            session.setIdentityDecision(com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE);
+            session.setVerifiedPremium(false);
+            startLoginTaskIfReady(player, session);
         }
     }
 
-    private void onLoginMessage(Player player, String playerName, UUID verifiedPremiumUuid) {
+    private void onLoginMessage(Player player, String playerName, LoginActionMessage message) {
         BukkitLoginSession playerSession = new BukkitLoginSession(playerName, true);
         // adopt the Mojang UUID the proxy verified. Without it the session carries no
         // UUID at all, and with premiumUuid:false the fallback in ForceLoginTask (the connection
         // UUID) is the offline one — so AuthMe would never get a premium_uuid written and the
         // player would be asked for a password on every single login. Null stays null: the proxy
         // only omits it when it verified nothing, and resolvePremiumUuid rejects non-v4 values.
-        playerSession.setUuid(verifiedPremiumUuid);
+        playerSession.setUuid(message.getVerifiedPremiumUuid());
+        playerSession.setConnectionUuid(player.getUniqueId());
+        playerSession.setFacts(message.getFacts());
+        playerSession.setVerifiedPremium(isVerifiedIdentity(message));
         startLoginTaskIfReady(player, playerSession);
     }
 
-    private void onRegisterMessage(Player player, String playerName, UUID verifiedPremiumUuid) {
+    private void onRegisterMessage(Player player, String playerName, LoginActionMessage message) {
         // Folia: use AsyncScheduler instead of Bukkit.getScheduler().runTaskAsynchronously()
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             AuthPlugin<Player> authPlugin = plugin.getCore().getAuthPluginHook();
             try {
                 //we need to check if the player is registered on Bukkit too
-                if (authPlugin == null || !authPlugin.isRegistered(playerName)) {
-                    BukkitLoginSession playerSession = new BukkitLoginSession(playerName, false);
-                    playerSession.setUuid(verifiedPremiumUuid);
+                boolean registered = authPlugin != null && authPlugin.isRegistered(playerName);
+                // Recovery of an auth-plugin premium account also needs a task when the proxy has no account yet:
+                // the confirmed login acknowledges premium ownership back to it.
+                if (!registered || authPlugin.inspectAccount(playerName)
+                        == com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.PREMIUM_OWNED) {
+                    BukkitLoginSession playerSession = new BukkitLoginSession(playerName, registered);
+                    playerSession.setUuid(message.getVerifiedPremiumUuid());
+                    playerSession.setConnectionUuid(player.getUniqueId());
+                    playerSession.setFacts(message.getFacts());
+                    playerSession.setVerifiedPremium(isVerifiedIdentity(message));
                     startLoginTaskIfReady(player, playerSession);
                 }
             } catch (Exception ex) {
@@ -141,8 +188,21 @@ public class BungeeListener implements PluginMessageListener {
         });
     }
 
+    /**
+     * A force action authenticates the connection when the proxy verified a Mojang
+     * identity, or when it verified the player through Floodgate. An undecided
+     * Java connection is not verified, even though the proxy sent a force action.
+     *
+     * @param message the proxy's login action
+     * @return whether the session may run the verified-identity decision table
+     */
+    private static boolean isVerifiedIdentity(LoginActionMessage message) {
+        return message.getIdentityDecision()
+                == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.PREMIUM_VERIFIED
+                || message.isBedrockVerified();
+    }
+
     private void startLoginTaskIfReady(Player player, BukkitLoginSession session) {
-        session.setVerifiedPremium(true);
         plugin.putSession(player.spigot().getRawAddress(), session);
 
         // only start a new login task if the join event fired earlier. This event then didn't

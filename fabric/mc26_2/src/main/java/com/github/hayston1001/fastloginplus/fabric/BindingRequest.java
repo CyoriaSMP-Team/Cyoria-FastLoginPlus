@@ -1,0 +1,26 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * Copyright (c) 2026 Hayston1001
+ */
+package com.github.hayston1001.fastloginplus.fabric;
+
+import com.github.hayston1001.fastloginplus.fabric.protocol.IdentityClaim.Decision;
+
+/** Requires password ownership before requesting a binding on either identity path. */
+final class BindingRequest {
+    private BindingRequest() {
+    }
+
+    static void requireBindable(Decision decision, boolean authenticated, AccountState state) {
+        if (!authenticated) {
+            throw FabricMessages.failure("binding-login-required");
+        }
+        if (decision != Decision.OFFLINE && decision != Decision.PREMIUM_VERIFIED) {
+            throw FabricMessages.failure("binding-identity-required");
+        }
+        if (state != AccountState.PASSWORD) {
+            throw FabricMessages.failure("binding-password-required");
+        }
+    }
+}

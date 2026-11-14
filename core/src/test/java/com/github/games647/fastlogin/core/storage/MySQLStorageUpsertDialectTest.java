@@ -1,33 +1,18 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.storage;
 
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -46,10 +31,67 @@ class MySQLStorageUpsertDialectTest {
         assertTrue(stmt.contains("`UUID`="));
         assertTrue(stmt.contains("`Premium`="));
         assertTrue(stmt.contains("`Floodgate`="));
+        assertTrue(stmt.contains("`SameNameCracked`="));
         assertTrue(stmt.contains("`LastIp`="));
         // byte-exact name comparison keeps the case-variant protection
         assertTrue(stmt.contains("HEX(`Name`)=HEX(VALUES(`Name`))"),
                 "case-variant duplicate must not overwrite the existing row");
+    }
+
+    /**
+     * Guards the binding contract in {@code SQLStorage.saveQuietly}: the insert
+     * branch binds six positional parameters, so the dialect statement must
+     * declare the same columns in the same order.  A drifted column list shifts
+     * every later value (a missing SameNameCracked once wrote LastIp into it).
+     */
+    @Test
+    void upsertStatementBindsTheSameColumnsAsTheBaseInsert() {
+        String upsert = MySQLStorage.INSERT_PROFILE_UPSERT;
+        String base = SQLStorage.INSERT_PROFILE;
+
+        assertEquals(insertColumns(base), insertColumns(upsert), "column list/order must match the base insert");
+        assertEquals(countPlaceholders(base), countPlaceholders(upsert), "placeholder count must match");
+    }
+
+    private static List<String> insertColumns(String sql) {
+        int start = sql.indexOf('(');
+        int end = sql.indexOf(')', start);
+        List<String> columns = new ArrayList<>();
+        for (String column : sql.substring(start + 1, end).split(",")) {
+            columns.add(column.trim().replace("`", ""));
+        }
+        return columns;
+    }
+
+    private static int countPlaceholders(String sql) {
+        int values = sql.indexOf("VALUES");
+        int start = sql.indexOf('(', values);
+        int end = sql.indexOf(')', start);
+        int count = 0;
+        for (String value : sql.substring(start + 1, end).split(",")) {
+            if ("?".equals(value.trim())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Bedrock/Floodgate prefixed names exceed the Java username limit. MySQL
+     * enforces the declared width, so existing tables must be widened in place
+     * and UUID lookups need an index.
+     */
+    @Test
+    void schemaMigrationsWidenTheNameColumnAndIndexTheUuid() {
+        assertTrue(SQLStorage.CREATE_TABLE_STMT.contains("`Name` VARCHAR(64) NOT NULL"),
+                "new tables must declare the widened Name column");
+
+        String widen = SQLStorage.WIDEN_NAME_COLUMN_STMT;
+        assertTrue(widen.contains("MODIFY COLUMN `Name` VARCHAR(64) NOT NULL"),
+                "MySQL enforces the VARCHAR width and must widen existing tables");
+
+        assertTrue(SQLStorage.CREATE_UUID_INDEX_STMT.contains("(`UUID`)"),
+                "UUID lookups must be indexed");
     }
 
     /**

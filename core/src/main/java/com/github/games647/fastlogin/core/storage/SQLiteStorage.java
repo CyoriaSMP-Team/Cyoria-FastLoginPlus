@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.storage;
 
@@ -49,12 +30,15 @@ public class SQLiteStorage extends SQLStorage {
             // MySQL is case-insensitive by default (utf8mb4 collations), while SQLite's default
             // BINARY collation is case-sensitive. COLLATE NOCASE aligns SQLite with MySQL so the
             // same player cannot get two rows (premium + cracked) that differ only by letter case.
-            + "`Name` VARCHAR(16) COLLATE NOCASE NOT NULL, "
+            + "`Name` VARCHAR(" + NAME_COLUMN_LENGTH + ") COLLATE NOCASE NOT NULL, "
             + "`Premium` BOOLEAN NOT NULL, "
             + "`LastIp` VARCHAR(255) NOT NULL, "
             + "`LastLogin` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
             //the premium shouldn't steal the cracked account by changing the name
             + "`Floodgate` INTEGER(3), "
+            // the persistent same-name cracked observation; rows migrated from
+            // older schemas may hold NULL, which reads as "not observed"
+            + "`SameNameCracked` INTEGER(3), "
             + "UNIQUE (`Name`) "
             + ')';
 
@@ -131,6 +115,19 @@ public class SQLiteStorage extends SQLStorage {
         }
     }
 
+    // callers that need the write result use this entry point directly, so it
+    // must take the same global SQLite lock as save() (the ReentrantLock makes
+    // the save() -> saveQuietly() delegation safe)
+    @Override
+    public boolean saveQuietly(StoredProfile playerProfile) {
+        lock.lock();
+        try {
+            return super.saveQuietly(playerProfile);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     @Override
     public boolean deleteProfile(String name) {
         lock.lock();
@@ -145,6 +142,20 @@ public class SQLiteStorage extends SQLStorage {
     public void createTables() throws SQLException {
         super.createTables();
         migrateCaseInsensitiveName();
+        // a table rebuild moves the indexes to the renamed old table and drops
+        // them with it, so re-assert the schema migrations on the final table
+        migrateSchema();
+    }
+
+    @Override
+    protected String getCreateUuidIndexStmt() {
+        return "CREATE INDEX IF NOT EXISTS `" + UUID_INDEX_NAME + "` ON `" + PREMIUM_TABLE + "` (`UUID`)";
+    }
+
+    @Override
+    protected String getWidenNameColumnStmt() {
+        // SQLite does not enforce VARCHAR lengths, so widening needs no rebuild
+        return null;
     }
 
     /**
@@ -179,8 +190,10 @@ public class SQLiteStorage extends SQLStorage {
                     // violate the new UNIQUE(Name) NOCASE constraint, so keep one row per name
                     // variant: premium rows win, otherwise the oldest (lowest UserID).
                     stmt.execute("INSERT INTO `" + PREMIUM_TABLE + "` "
-                            + "(`UserID`, `UUID`, `Name`, `Premium`, `Floodgate`, `LastIp`, `LastLogin`) "
-                            + "SELECT `UserID`, `UUID`, `Name`, `Premium`, `Floodgate`, `LastIp`, `LastLogin` "
+                            + "(`UserID`, `UUID`, `Name`, `Premium`, `Floodgate`, `SameNameCracked`, "
+                            + "`LastIp`, `LastLogin`) "
+                            + "SELECT `UserID`, `UUID`, `Name`, `Premium`, `Floodgate`, `SameNameCracked`, "
+                            + "`LastIp`, `LastLogin` "
                             + "FROM `premium_old` AS p "
                             + "WHERE `UserID` = ("
                             + "SELECT `UserID` FROM `premium_old` AS q "
@@ -223,11 +236,13 @@ public class SQLiteStorage extends SQLStorage {
     // but does NOT overwrite the existing row - preserving the anti
     // name-stealing semantics of the MySQLStorage upsert.
     private static final String INSERT_PROFILE_UPSERT = "INSERT INTO `" + PREMIUM_TABLE
-            + "` (`UUID`, `Name`, `Premium`, `Floodgate`, `LastIp`) VALUES (?, ?, ?, ?, ?) "
+            + "` (`UUID`, `Name`, `Premium`, `Floodgate`, `SameNameCracked`, `LastIp`) VALUES (?, ?, ?, ?, ?, ?) "
             + "ON CONFLICT(`Name`) DO UPDATE SET "
             + "`UUID`=CASE WHEN hex(`Name`)=hex(excluded.`Name`) THEN excluded.`UUID` ELSE `UUID` END, "
             + "`Premium`=CASE WHEN hex(`Name`)=hex(excluded.`Name`) THEN excluded.`Premium` ELSE `Premium` END, "
             + "`Floodgate`=CASE WHEN hex(`Name`)=hex(excluded.`Name`) THEN excluded.`Floodgate` ELSE `Floodgate` END, "
+            + "`SameNameCracked`=CASE WHEN hex(`Name`)=hex(excluded.`Name`) "
+            + "THEN excluded.`SameNameCracked` ELSE `SameNameCracked` END, "
             + "`LastIp`=CASE WHEN hex(`Name`)=hex(excluded.`Name`) THEN excluded.`LastIp` ELSE `LastIp` END";
 
     @Override

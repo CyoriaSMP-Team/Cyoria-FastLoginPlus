@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.task;
 
@@ -55,6 +36,9 @@ public class ForceLoginTask extends ForceLoginManagement<Player, CommandSender, 
     public void run() {
         // block this target player for BungeeCord ID brute force attacks
         FastLoginBukkit plugin = core.getPlugin();
+        if (plugin.getProxyBedrockPreLogin() != null && plugin.getProxyBedrockPreLogin().isHandled(player)) {
+            return;
+        }
         player.setMetadata(core.getPlugin().getName(), new FixedMetadataValue(plugin, true));
 
         if (session != null && !session.getUsername().equals(player.getName())) {
@@ -67,10 +51,19 @@ public class ForceLoginTask extends ForceLoginManagement<Player, CommandSender, 
 
         // AuthMe 6.0: if we just registered/logged in a premium player,
         // also mark them as premium in AuthMe's database
-        if (session != null && session.isVerifiedPremium()) {
+        if (session != null && session.isVerifiedPremium() && premiumHandlingAllowed) {
             com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
                 plugin.getAuthMePremiumIntegrator();
-            if (integrator != null && integrator.isAuthMePremiumEnabled()) {
+            boolean premiumMarkingAllowed = false;
+            try {
+                premiumMarkingAllowed = plugin.getConfig().getBoolean("autoLogin")
+                        && plugin.getCore().getAuthPluginHook() != null
+                        && plugin.getCore().getAuthPluginHook().isRegistered(player.getName());
+            } catch (Exception isRegisteredError) {
+                plugin.getLog().warn("Could not verify AuthMe registration for {}; skipping premium marking",
+                        player.getName());
+            }
+            if (integrator != null && integrator.isAuthMePremiumEnabled() && premiumMarkingAllowed) {
                 // the session UUID is the Mojang UUID the proxy verified
                 // and now sends along with the force message; it is null only when the proxy
                 // verified nothing. Fall back to the connection UUID otherwise. Handing null
@@ -133,6 +126,21 @@ public class ForceLoginTask extends ForceLoginManagement<Player, CommandSender, 
     @Override
     public String getName(Player player) {
         return player.getName();
+    }
+
+    @Override
+    public void denyLogin(Player player, String message) {
+        Bukkit.getScheduler().runTask(core.getPlugin(), () -> player.kickPlayer(message));
+    }
+
+    @Override
+    protected void notifyPasswordLogin() {
+        Bukkit.getScheduler().runTask(core.getPlugin(), () -> core.getPlugin().sendPasswordNotice(player));
+    }
+
+    @Override
+    protected void notifyPremiumPolicyDisabled() {
+        Bukkit.getScheduler().runTask(core.getPlugin(), () -> core.getPlugin().sendPremiumPolicyNotice(player));
     }
 
     @Override

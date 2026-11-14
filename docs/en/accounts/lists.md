@@ -1,0 +1,45 @@
+# Premium/cracked lists and admission
+
+## Enable the offline whitelist
+
+{% hint style="warning" %}
+**Back up the authentication database first.** `/flp cracked` can change existing accounts; with AuthMe it can remove or reset an account record.
+{% endhint %}
+
+1. Stop the server. In a proxy deployment, stop the proxy and edit its FLP configuration; on a standalone server, edit the local FLP configuration.
+2. Set `offline-whitelist` to `true`, then start the server.
+3. On a backend, run `/flp cracked <player>` as an authorized administrator to add each offline player who needs access.
+4. Use test accounts to check that known players can reach authentication and unknown offline players are refused.
+
+{% hint style="info" %}
+An existing authentication-plugin account does not mean FLP already knows the name. The whitelist does not replace password, Mojang or Floodgate authentication. See [commands and permissions](commands.md).
+{% endhint %}
+
+## Delete a non-premium list record
+
+1. Confirm the target name and account state, and back up FLP and authentication-plugin data.
+2. On a backend, run `/flp delete <player>` and wait for the final result.
+
+{% hint style="info" %}
+`/flp delete` does not directly delete premium records or reset authentication-plugin accounts. Review and deliberately switch a premium account first. Switching can change or remove an authentication account; read [binding and switching](binding.md) before acting.
+{% endhint %}
+
+## What the lists do
+
+FLP distinguishes premium and non-premium lists. `/flp premium` and `/flp cracked` change list status; `offline-whitelist` uses those known records to restrict admission.
+
+In proxy mode, the proxy's FLP database is authoritative. An AuthMe/EasyAuth account is **local authentication state**, not membership in an FLP list. Creating or deleting an auth account does not by itself synchronize the FLP list, and deleting an FLP record is not an auth-account reset.
+
+Premium players on the list still need verification on each connection. Non-premium players normally use password login. Do not edit the database directly to bypass account ownership checks.
+
+## Same-name offline fallback
+
+`secondAttemptCracked` defaults to `false`. When enabled, a confirmed premium verification failure for a name without binding consent can cause later connections to use password login. The first change is accompanied by a notice pointing to `/flp premium`.
+
+- A consented name does not fall back merely because an impostor attempted to connect.
+- On standalone servers, an explicit session rejection is distinguished from an unreachable session service and an interrupted attempt.
+- On a proxy the proxy performs the verification, so FLP takes the outcome from the login connection. Where the proxy exposes its login phase, a client that answered encryption and then failed verification is counted as soon as the connection closes; a client that never answered is settled by the 30-second grace period, like any other unfinished attempt.
+- Cancelling after answering, or losing the connection during verification, can also be counted as one failure. A successful verification, `/flp premium` or `/flp cracked` clears the record.
+- If the fallback sends the player to password login and the backend still treats the name as a bound premium account, the backend refuses that login as an ownership conflict. Clear the backend binding first.
+
+Keep this off unless you understand the trade-off. Do not enable it as a general workaround for Mojang outages or a wrongly configured proxy.

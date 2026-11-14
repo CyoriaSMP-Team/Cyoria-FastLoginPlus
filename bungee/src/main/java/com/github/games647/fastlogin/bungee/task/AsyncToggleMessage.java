@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bungee.task;
 
@@ -91,8 +72,10 @@ public class AsyncToggleMessage implements Runnable {
             sendMessage("database-error");
             return;
         }
-        //existing player is already cracked
-        if (playerProfile.isExistingPlayer() && !playerProfile.isOnlinemodePreferred()) {
+        //existing player is already fully cracked: no consent, no premium UUID
+        // observation and no same-name cracked observation left to clear
+        if (playerProfile.isExistingPlayer() && !playerProfile.isOnlinemodePreferred()
+                && playerProfile.getId() == null && !playerProfile.isSameNameCracked()) {
             if (core.isDebug()) {
                 core.getPlugin().getLog().info("{} is already cracked; skipping toggle", targetPlayer);
             }
@@ -107,7 +90,11 @@ public class AsyncToggleMessage implements Runnable {
 
         playerProfile.setOnlinemodePreferred(false);
         playerProfile.setId(null);
-        core.getStorage().save(playerProfile);
+        playerProfile.setSameNameCracked(false);
+        if (!core.getStorage().saveQuietly(playerProfile)) {
+            sendMessage("database-error");
+            return;
+        }
         if (core.isDebug()) {
             core.getPlugin().getLog().info("Marked {} as cracked in proxy database", targetPlayer);
         }
@@ -156,6 +143,9 @@ public class AsyncToggleMessage implements Runnable {
         }
 
         playerProfile.setOnlinemodePreferred(true);
+        // an explicit consent supersedes any same-name cracked observation: the
+        // name goes back to premium verification on every connection
+        playerProfile.setSameNameCracked(false);
 
         // Resolve and store the Mojang UUID so the profile carries the
         // correct premium UUID — without this, on reconnect the proxy may
@@ -174,7 +164,10 @@ public class AsyncToggleMessage implements Runnable {
                 "Failed to resolve Mojang UUID for {} during premium toggle", targetPlayer, e);
         }
 
-        core.getStorage().save(playerProfile);
+        if (!core.getStorage().saveQuietly(playerProfile)) {
+            sendMessage("database-error");
+            return;
+        }
         if (core.isDebug()) {
             core.getPlugin().getLog().info("Marked {} as premium in proxy database", targetPlayer);
         }
@@ -206,6 +199,10 @@ public class AsyncToggleMessage implements Runnable {
         } else {
             CommandSender console = ProxyServer.getInstance().getConsole();
             console.sendMessage(TextComponent.fromLegacyText(message));
+            // The carrier is the admin's connection for an in-game
+            // /flp ... <target> command, so mirror the proxy's final result
+            // there instead of leaving it in the proxy log only.
+            sender.sendMessage(TextComponent.fromLegacyText(message));
             // route the result back to the backend console that issued the
             // relayed command (over the carrier player's server connection)
             sendFeedbackToBackend(localeId);

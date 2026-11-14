@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.velocity;
 
@@ -62,6 +43,7 @@ import com.google.common.io.ByteStreams;
 import com.google.inject.Inject;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.event.Subscribe;
+import com.velocitypowered.api.event.command.PostCommandInvocationEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.plugin.Plugin;
@@ -88,6 +70,7 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
 
     /** AuthMe's Velocity proxy plugin — owns the config file and the reload command. */
     private static final String AUTHME_PLUGIN_ID = "authmevelocity";
+    private final AuthMeProxyDiagnostics authMeProxyDiagnostics = new AuthMeProxyDiagnostics();
     private static final String AUTHME_PLUGIN_NAME = "AuthMe Velocity";
     private static final String AUTHME_RELOAD_COMMAND = "avreloadproxy";
     /** AuthMe's own ConfigMe property holder — the source of truth for the flag. */
@@ -102,6 +85,7 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
     private FloodgateService floodgateService;
     private GeyserService geyserService;
     private UUID proxyId;
+    private com.github.games647.fastlogin.velocity.listener.CrackedNoticeDelivery crackedNoticeDelivery;
 
     @Inject
     public FastLoginVelocity(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
@@ -112,6 +96,8 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
 
     @Subscribe
     public void onProxyInitialization(ProxyInitializeEvent event) {
+        authMeProxyDiagnostics.warnAtStartup(
+                () -> server.getPluginManager().getPlugin(AUTHME_PLUGIN_ID).isPresent(), logger);
         scheduler = new AsyncScheduler(logger, task -> server.getScheduler().buildTask(this, task).schedule());
         core = new FastLoginCore<>(this);
         // Proxies ship a trimmed config template without backend-only keys
@@ -119,6 +105,8 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
         core.load();
         loadOrGenerateProxyId();
         if (!core.setupDatabase() || proxyId == null) {
+            logger.error("FastLoginPlus is not active: the database or proxy ID could not be initialised. "
+                    + "Fix the configuration and restart the proxy.");
             return;
         }
 
@@ -131,11 +119,16 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
         }
 
         forceAuthMeProxyUuidMode();
+        reassertAuthMeAutoLoginPin();
 
         server.getEventManager().register(this, new ConnectListener(this, core.getAntiBotService()));
         server.getEventManager().register(this, new PluginMessageListener(this));
+        crackedNoticeDelivery = new com.github.games647.fastlogin.velocity.listener.CrackedNoticeDelivery(this);
+        server.getEventManager().register(this, crackedNoticeDelivery);
 
         ChannelRegistrar channelRegistry = server.getChannelRegistrar();
+        channelRegistry.register(MinecraftChannelIdentifier.create(getName(),
+                com.github.games647.fastlogin.protocol.CrackedNoticeWire.CHANNEL));
         channelRegistry.register(MinecraftChannelIdentifier.create(getName(), ChangePremiumMessage.CHANGE_CHANNEL));
         channelRegistry.register(MinecraftChannelIdentifier.create(getName(), SuccessMessage.SUCCESS_CHANNEL));
         channelRegistry.register(MinecraftChannelIdentifier.create(getName(), DeletePremiumMessage.DELETE_CHANNEL));
@@ -147,6 +140,9 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
     public void onProxyShutdown(ProxyShutdownEvent event) {
         // stop scheduling before closing shared resources
         scheduler.shutdown();
+        // in-flight storage tasks may still be writing — let them finish
+        // before core.close() shuts the database pool down underneath them
+        scheduler.awaitQuiescence(Duration.ofSeconds(3));
 
         if (core != null) {
             core.close();
@@ -196,6 +192,10 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
     @Override
     public AsyncScheduler getScheduler() {
         return scheduler;
+    }
+
+    public com.github.games647.fastlogin.velocity.listener.CrackedNoticeDelivery getCrackedNoticeDelivery() {
+        return crackedNoticeDelivery;
     }
 
     @Override
@@ -263,6 +263,30 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
     }
 
     /**
+     * Reassert after AuthMe's synchronous command body, not before it reloads its settings.
+     *
+     * @param event completed command invocation
+     */
+    @Subscribe
+    public void onAuthMeReload(PostCommandInvocationEvent event) {
+        if (isAuthMeReloadCommand(event.getCommand())) {
+            reassertAuthMeAutoLoginPin();
+        }
+    }
+
+    static boolean isAuthMeReloadCommand(String command) {
+        return command != null && AUTHME_RELOAD_COMMAND.equalsIgnoreCase(
+                command.trim().replaceFirst("^/", "").split("\\s+")[0]);
+    }
+
+    void reassertAuthMeAutoLoginPin() {
+        Object authMe = resolvePluginInstance(server.getPluginManager(), AUTHME_PLUGIN_ID);
+        String version = server.getPluginManager().getPlugin(AUTHME_PLUGIN_ID)
+                .flatMap(container -> container.getDescription().getVersion()).orElse("");
+        AuthMeProxyPin.forceAutoLoginOff(authMe, AUTHME_CONFIG_PROPERTIES_CLASS, version, logger);
+    }
+
+    /**
      * Fallback path for {@link #forceAuthMeProxyUuidMode()}: rewrite the config file and ask
      * AuthMe Velocity to reload itself through its own command.
      *
@@ -327,6 +351,7 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
             server.getCommandManager().executeAsync(console, AUTHME_RELOAD_COMMAND)
                     .whenComplete((executed, error) -> {
                         if (error == null && Boolean.TRUE.equals(executed)) {
+                            reassertAuthMeAutoLoginPin();
                             logger.info("Reloaded {}; premium.{}=false is now active",
                                     AUTHME_PLUGIN_NAME, AuthMeProxyConfig.OFFLINE_UUID_KEY);
                         } else if (attempt < AUTHME_RELOAD_ATTEMPTS) {
@@ -393,8 +418,7 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
                     proxyId = UUID.fromString(lines.get(0));
                 }
             } catch (IOException e) {
-                logger.error("Unable to load proxy id from '{}'", idFile.toAbsolutePath());
-                logger.error("Detailed exception:", e);
+                logger.error("Unable to load proxy id from '{}'", idFile.toAbsolutePath(), e);
             } catch (IllegalArgumentException e) {
                 Path filePath = idFile.toAbsolutePath();
                 logger.error("'{}' contains an invalid uuid! FastLogin will not work without a valid id.", filePath);
@@ -408,8 +432,7 @@ public class FastLoginVelocity implements PlatformPlugin<CommandSource> {
             try {
                 Files.write(idFile, Collections.singletonList(proxyId.toString()), StandardOpenOption.CREATE);
             } catch (IOException e) {
-                logger.error("Unable to save proxy id to '{}'", idFile.toAbsolutePath());
-                logger.error("Detailed exception:", e);
+                logger.error("Unable to save proxy id to '{}'", idFile.toAbsolutePath(), e);
             }
         }
     }

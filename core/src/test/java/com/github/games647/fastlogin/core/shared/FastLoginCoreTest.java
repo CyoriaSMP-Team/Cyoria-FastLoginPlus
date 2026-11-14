@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.core.shared;
 
@@ -31,15 +12,18 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Regression test: pendingConfirms must be a concurrent set —
@@ -49,10 +33,12 @@ import static org.mockito.Mockito.mock;
  */
 class FastLoginCoreTest {
 
+    private final AtomicLong now = new AtomicLong();
+
     @Test
     void pendingConfirmsAddShouldHaveSingleWinnerUnderConcurrency() throws Exception {
         PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
-        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin);
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
         UUID player = UUID.randomUUID();
         int threads = 16;
 
@@ -91,5 +77,160 @@ class FastLoginCoreTest {
         assertEquals(10, FastLoginCore.validatedLimit(logger, "burst-limit", 10, 10));
         assertEquals(300_000L, FastLoginCore.validatedDurationMs(logger, "expire", 0, 300_000L));
         assertEquals(600_000L, FastLoginCore.validatedDurationMs(logger, "expire", 600_000L, 300_000L));
+    }
+
+    // ---- the settled verification verdicts ----
+
+    @Test
+    void settleCountsOnlyWhenTheSessionServerAnswers() {
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        when(plugin.getLog()).thenReturn(mock(org.slf4j.Logger.class));
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
+
+        core.markPendingVerification("TestUser");
+        now.addAndGet(FastLoginCore.VERIFICATION_GRACE_MS);
+        core.settlePendingVerifications(true);
+        assertEquals(1, core.getDefiniteFailures("TestUser"),
+                "the session server answers: the client itself could not verify");
+
+        core.markPendingVerification("OtherUser");
+        now.addAndGet(FastLoginCore.VERIFICATION_GRACE_MS);
+        core.settlePendingVerifications(false);
+        assertEquals(0, core.getDefiniteFailures("OtherUser"),
+                "an authentication outage is not a failed identity");
+        core.settlePendingVerifications(true);
+        assertEquals(0, core.getDefiniteFailures("OtherUser"),
+                "an outage attempt must not be charged when the session server recovers");
+    }
+
+    @Test
+    void sweepWaitsForGraceThenCountsOnlyOnce() {
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        when(plugin.getLog()).thenReturn(mock(org.slf4j.Logger.class));
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
+
+        core.markPendingVerification("TestUser");
+        core.settlePendingVerifications(true);
+
+        assertEquals(0, core.getDefiniteFailures("TestUser"), "a fresh attempt must be allowed to finish");
+        now.set(FastLoginCore.VERIFICATION_GRACE_MS - 1);
+        core.settlePendingVerifications(true);
+        assertEquals(0, core.getDefiniteFailures("TestUser"));
+        now.incrementAndGet();
+        core.settlePendingVerifications(true);
+        assertEquals(1, core.getDefiniteFailures("TestUser"));
+        core.settlePendingVerifications(true);
+        assertEquals(1, core.getDefiniteFailures("TestUser"), "a sweep must not charge the same attempt twice");
+    }
+
+    @Test
+    void quickRetryDoesNotPushTheSettlementAway() {
+        // Repeated requests share a mark and cannot postpone settlement.
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        when(plugin.getLog()).thenReturn(mock(org.slf4j.Logger.class));
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
+
+        core.markPendingVerification("TestUser");
+        now.set(FastLoginCore.VERIFICATION_GRACE_MS - 1);
+        core.markPendingVerification("TESTUSER");
+        now.incrementAndGet();
+        core.settlePendingVerifications(true);
+
+        assertEquals(1, core.getDefiniteFailures("TestUser"));
+    }
+
+    @Test
+    void definiteVerdictCountsAndClearsThePending() {
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
+
+        core.markPendingVerification("TestUser");
+        core.recordDefiniteFailure("TestUser");
+        assertEquals(1, core.getDefiniteFailures("TESTUSER"),
+                "a definitive verdict is name-keyed and case-insensitive");
+
+        // the settlement must not count it a second time
+        now.addAndGet(FastLoginCore.VERIFICATION_GRACE_MS);
+        core.settlePendingVerifications(true);
+        assertEquals(1, core.getDefiniteFailures("TestUser"));
+    }
+
+    @Test
+    void droppedAttemptsAndVerificationsCountNothing() {
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
+
+        core.markPendingVerification("Dropped");
+        core.dropPendingVerification("Dropped");
+        now.addAndGet(FastLoginCore.VERIFICATION_GRACE_MS);
+        core.settlePendingVerifications(true);
+        assertEquals(0, core.getDefiniteFailures("Dropped"), "a dropped attempt counts nothing");
+
+        core.recordDefiniteFailure("Verified");
+        core.resetVerificationState("Verified");
+        assertEquals(0, core.getDefiniteFailures("Verified"),
+                "a passing verification refutes everything recorded");
+    }
+
+    @Test
+    void lateSuccessClearsSettledAndExplicitFailuresAndPendingRetries() {
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        when(plugin.getLog()).thenReturn(mock(org.slf4j.Logger.class));
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
+
+        core.markPendingVerification("TestUser");
+        now.addAndGet(FastLoginCore.VERIFICATION_GRACE_MS);
+        core.settlePendingVerifications(true);
+        core.recordDefiniteFailure("TESTUSER");
+        assertEquals(2, core.getDefiniteFailures("testuser"));
+        core.markPendingVerification("TestUser");
+        core.resetVerificationState("TESTUSER");
+        now.addAndGet(FastLoginCore.VERIFICATION_GRACE_MS);
+        core.settlePendingVerifications(true);
+
+        assertEquals(0, core.getDefiniteFailures("TestUser"), "late success refutes every recorded failure");
+    }
+
+    @Test
+    void successAndSettlementCannotLeaveAStaleFailureUnderConcurrency() throws Exception {
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        when(plugin.getLog()).thenReturn(mock(org.slf4j.Logger.class));
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin, now::get);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            for (int attempt = 0; attempt < 200; attempt++) {
+                core.markPendingVerification("TestUser");
+                now.addAndGet(FastLoginCore.VERIFICATION_GRACE_MS);
+                CyclicBarrier start = new CyclicBarrier(2);
+                Future<?> settlement = pool.submit(() -> {
+                    start.await(5, TimeUnit.SECONDS);
+                    core.settlePendingVerifications(true);
+                    return null;
+                });
+                Future<?> success = pool.submit(() -> {
+                    start.await(5, TimeUnit.SECONDS);
+                    core.resetVerificationState("TESTUSER");
+                    return null;
+                });
+                settlement.get(5, TimeUnit.SECONDS);
+                success.get(5, TimeUnit.SECONDS);
+                assertEquals(0, core.getDefiniteFailures("testuser"));
+            }
+        } finally {
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void sameNameCrackedNoticeIsConsumedOnce() {
+        PlatformPlugin<Object> plugin = mock(PlatformPlugin.class);
+        FastLoginCore<Object, Object, PlatformPlugin<Object>> core = new FastLoginCore<>(plugin);
+
+        core.queueSameNameCrackedNotice("TestUser");
+        assertTrue(core.consumeSameNameCrackedNotice("testuser"),
+                "the queued notice is name-keyed and case-insensitive");
+        assertFalse(core.consumeSameNameCrackedNotice("TestUser"),
+                "the one-time notice must not be delivered twice");
     }
 }

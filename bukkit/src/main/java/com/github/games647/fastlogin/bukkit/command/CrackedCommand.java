@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit.command;
 
@@ -29,6 +10,7 @@ import com.github.games647.fastlogin.bukkit.FastLoginBukkit;
 import com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator;
 import com.github.games647.fastlogin.bukkit.event.BukkitFastLoginPremiumToggleEvent;
 import com.github.games647.fastlogin.core.storage.StoredProfile;
+import com.github.games647.fastlogin.core.storage.SQLStorage;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
@@ -69,17 +51,6 @@ public class CrackedCommand extends ToggleCommand {
         Player player = (Player) sender;
         String playerName = sender.getName();
 
-        // Always clear AuthMe locally — AuthMe is on the backend,
-        // the proxy (BungeeCord/Velocity) cannot access it.
-        // This must run even when the command is forwarded to a proxy.
-        AuthMePremiumIntegrator integrator = plugin.getAuthMePremiumIntegrator();
-        if (integrator != null) {
-            integrator.clearPlayerPremium(playerName);
-        } else {
-            plugin.getLog().warn("CrackedCommand: authMePremiumIntegrator is null, "
-                + "skipping AuthMe cleanup for {}", playerName);
-        }
-
         // Forward to proxy if enabled; proxy handles profile persistence,
         // messages, kick — the backend has no DB in proxy mode.
         if (forwardCrackedCommand(sender, playerName)) {
@@ -99,16 +70,21 @@ public class CrackedCommand extends ToggleCommand {
                             plugin.getCore().sendLocaleMessage("database-error", sender));
                     return;
                 }
-                if (!profile.isOnlinemodePreferred()) {
+                //already fully cracked: no consent, no premium UUID and no
+                //same-name cracked observation left to clear
+                if (!profile.isOnlinemodePreferred() && profile.getId() == null
+                        && !profile.isSameNameCracked()) {
                     plugin.getScheduler().getSyncExecutor().execute(() ->
                             plugin.getCore().sendLocaleMessage("not-premium", sender));
                     return;
                 }
 
-                profile.setOnlinemodePreferred(false);
-                profile.setId(null);
-
-                plugin.getCore().getStorage().save(profile);
+                if (!persistCrackedProfile(profile, plugin.getCore().getStorage())) {
+                    plugin.getScheduler().getSyncExecutor().execute(() ->
+                            plugin.getCore().sendLocaleMessage("database-error", sender));
+                    return;
+                }
+                clearAuthMePremium(playerName);
 
                 // Local path (no proxy): event + kick
                 plugin.getServer().getPluginManager().callEvent(
@@ -137,16 +113,6 @@ public class CrackedCommand extends ToggleCommand {
 
         String playerName = args[0];
 
-        // Always clear AuthMe locally — same as onCrackedSelf().
-        // AuthMe is on the backend, the proxy cannot access it.
-        AuthMePremiumIntegrator integrator = plugin.getAuthMePremiumIntegrator();
-        if (integrator != null) {
-            integrator.clearPlayerPremium(playerName);
-        } else if (plugin.getCore().isDebug()) {
-            plugin.getLog().info("CrackedCommand: authMePremiumIntegrator is null, "
-                + "skipping AuthMe cleanup for {}", playerName);
-        }
-
         // Forward to proxy if enabled; proxy handles profile persistence,
         // messages, kick — the backend has no DB in proxy mode.
         if (forwardCrackedCommand(sender, playerName)) {
@@ -166,26 +132,63 @@ public class CrackedCommand extends ToggleCommand {
                     return;
                 }
 
-                //existing player is already cracked
-                if (profile.isExistingPlayer() && !profile.isOnlinemodePreferred()) {
+                //already fully cracked: no consent, no premium UUID and no
+                //same-name cracked observation left to clear
+                if (profile.isExistingPlayer() && !profile.isOnlinemodePreferred()
+                        && profile.getId() == null && !profile.isSameNameCracked()) {
                     plugin.getScheduler().getSyncExecutor().execute(() ->
                             plugin.getCore().sendLocaleMessage("not-premium-other", sender));
                     return;
                 }
 
+                if (!persistCrackedProfile(profile, plugin.getCore().getStorage())) {
+                    plugin.getScheduler().getSyncExecutor().execute(() ->
+                            plugin.getCore().sendLocaleMessage("database-error", sender));
+                    return;
+                }
+                clearAuthMePremium(playerName);
+
                 plugin.getScheduler().getSyncExecutor().execute(() ->
                         plugin.getCore().sendLocaleMessage("remove-premium-other", sender));
-
-                profile.setOnlinemodePreferred(false);
-                profile.setId(null);
-
-                plugin.getCore().getStorage().save(profile);
 
                 // Local path (no proxy): event
                 plugin.getServer().getPluginManager().callEvent(
                         new BukkitFastLoginPremiumToggleEvent(sender, profile, PremiumToggleReason.COMMAND_OTHER));
             });
         });
+    }
+
+    // Persist-first ordering: the FLP profile row must be durably cracked
+    // before the destructive AuthMe premium wipe runs. Reversing the order
+    // strands players when the database write fails after AuthMe was cleared.
+    static boolean persistCrackedProfile(StoredProfile profile, SQLStorage storage) {
+        boolean wasOnlineModePreferred = profile.isOnlinemodePreferred();
+        java.util.UUID wasId = profile.getId();
+        boolean wasSameNameCracked = profile.isSameNameCracked();
+        profile.setOnlinemodePreferred(false);
+        profile.setId(null);
+        profile.setSameNameCracked(false);
+        if (storage.saveQuietly(profile)) {
+            return true;
+        }
+        // Roll the in-memory row back: a failed write must never discard the
+        // verified identity the player already holds.
+        profile.setOnlinemodePreferred(wasOnlineModePreferred);
+        profile.setId(wasId);
+        profile.setSameNameCracked(wasSameNameCracked);
+        return false;
+    }
+
+    private void clearAuthMePremium(String playerName) {
+        // AuthMe lives on the backend; a proxy cannot reach it, so this runs
+        // on the backend in both forwarded and local paths.
+        AuthMePremiumIntegrator integrator = plugin.getAuthMePremiumIntegrator();
+        if (integrator != null) {
+            integrator.clearPlayerPremium(playerName);
+        } else {
+            plugin.getLog().warn("CrackedCommand: authMePremiumIntegrator is null, "
+                + "skipping AuthMe cleanup for {}", playerName);
+        }
     }
 
     private boolean forwardCrackedCommand(CommandSender sender, String target) {

@@ -1,39 +1,20 @@
-#
 # SPDX-License-Identifier: MIT
 #
-# The MIT License (MIT)
-#
-# Copyright (c) 2015-2026 games647, Hayston and contributors
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-#
+# Copyright (c) 2026 games647 and contributors
+# Copyright (c) 2026 Hayston1001
 
 # Project: https://github.com/Hayston1001/FastLoginPlus
 
 # ========================================
 # FastLoginPlus Configuration (BungeeCord / Velocity proxy)
 # ========================================
-# This template ships with the BungeeCord/Velocity plugin. The proxy is the
-# decision maker in proxy deployments: it runs all Mojang API queries, owns
-# the database, and forwards force-login commands to the backends.
-# Backend-only keys (verifyClientKeys, respectIpLimit) and behaviorally inert
-# keys (useProxyAgnosticResolver) are NOT present here.
+# The proxy verifies identities, manages network policy and owns the FLP list.
+# Backends check their local auth accounts and execute login or registration.
+# [Proxy] Settings in this file apply on the proxy.
+# [Proxy policy -> backend] The proxy sends the policy to backends, which apply
+# it when deciding local account actions.
+# Backend-local settings belong in the backend's config.yml or, for Fabric,
+# config/fastloginplus-fabric.yml.
 
 # ========================================
 # Language
@@ -55,6 +36,7 @@ update-check-interval: 24
 # Anti-bot
 # ========================================
 # Simple anti-bot protection. For serious protection, use a dedicated firewall
+# Limit hits always reject the connection with the kick-antibot message.
 # Enforced here by the proxy's connection listener.
 anti-bot:
   enabled: true
@@ -62,10 +44,6 @@ anti-bot:
   connections: 600
   # Minutes before entries expire
   expire: 10
-  # Action when limit is hit: 'ignore' (FastLogin stops handling the connection —
-  # login continues as a normal cracked login, no Mojang/DB requests) or 'block'
-  # (reject the connection with the kick-antibot message)
-  action: 'ignore'
 
   # --- Per-IP rate limiting ---
   # Max connections per IP in the long window
@@ -92,43 +70,34 @@ anti-bot:
 # ========================================
 # Premium Detection
 # ========================================
-# Auto-register new premium players on first join
-# Runs on the proxy: Mojang lookup, DB write and online-mode toggle happen
-# here; the backend only executes forceLogin/forceRegister through its auth
-# plugin.
-autoRegister: true
+# Route new premium names to verification. Account creation still depends on
+# backend policy and account ownership; other checks may also verify.
+autoRegister: false
 
-# Enable auto-login for premium players
-# The proxy decides and forwards the force-login command to the backend,
-# which executes it through the auth plugin.
+# [Proxy policy -> backend]
+# Allow auto-login for verified premium players. This policy is sent to backends,
+# which check their local accounts and enforce it.
 autoLogin: true
 
-# Use premium UUID for premium players
-# The native proxy API handles the premium UUID. false = override the premium
-# UUID with the offline UUID (demote).
-# This setting is the single authority on which UUID reaches the backend. If
-# AuthMe's proxy plugin (AuthMeBungee / AuthMe Velocity) is installed,
-# FastLoginPlus pins its premium.keepOfflineUuidCompatibility to false and reloads it.
+# Use the verified premium UUID instead of the offline UUID. This does not
+# enable verification or migrate player data. FLP sets AuthMeBungee/AuthMe
+# Velocity's premium.keepOfflineUuidCompatibility to false when present.
 premiumUuid: true
 
-# Query Mojang API for new players and detect name changes by UUID
-# If a player's name is not in the database but their UUID is (under an old name),
-# the old record is updated with the new name and they log in as premium
+# Look up new names and reconcile proxy FLP records by UUID after a name change.
+# This does not migrate backend accounts or player data.
 nameChangeCheck: true
 
-# If an offline player uses a premium username but fails authentication, 
-# remember them so they can join in offline mode next time (not recommended)
+# Remember eligible failed premium verification attempts for an offline retry
+# (not recommended). Confirmed premium accounts are not downgraded.
 secondAttemptCracked: false
 
 # ========================================
 # Offline Whitelist
 # ========================================
-# When enabled, offline players not present in the database will be denied entry (custom kick message available)
-# Offline players already in the database may still join
-# No restrictions apply to online players
-# Use /flp cracked <player> to add offline players to the database
-# Use /flp delete <player> to remove offline players from the database
-# Enforced by the proxy.
+# Deny offline Java names unknown to the proxy's FLP list. This controls
+# admission, not password or premium authentication. Manage the list with
+# /flp cracked and /flp delete on a backend.
 offline-whitelist: false
 
 # ========================================
@@ -151,12 +120,12 @@ verify-backend-messages: true
 # ========================================
 # Command Behavior
 # ========================================
-# Show warning before /flp premium command takes effect
-# The proxy asks for confirmation when a backend forwards the toggle.
+# Ask for confirmation for self-invoked premium toggles from classic and Fabric
+# backends. An administrator acting on another player is not prompted.
 premium-warning: true
 
-# Kick the player from the server after they confirm /flp premium, forcing them to reconnect
-# The proxy kicks the player after a toggle.
+# After a toggle, kick the player if true; otherwise keep the session.
+# Reconnection is manual. Classic backends also have a queued-toggle setting.
 kick-toggle: true
 
 # ========================================
@@ -165,15 +134,15 @@ kick-toggle: true
 # Enable verbose logging for troubleshooting.
 debug: false
 
-# Auto-register players in flp DB but missing from auth plugin DB
-# Decided by the proxy; the backend executes the registration through the
-# auth plugin.
-auto-register-unknown: true
+# [Proxy policy -> backend]
+# Allow backends to automatically create a missing auth-plugin account for a
+# verified premium player. If false, they use normal registration. This policy
+# does not create accounts for unverified offline players.
+auto-register-unknown: false
 
 # ======[[ Mojang API retry ]]======
-# Retry count for Name→UUID lookups (findProfile). Session verification is the
-# proxy's native online-mode login and is NOT covered by this retry.
-# Total attempts per request
+# Total attempts for Mojang name-to-UUID lookups. The proxy's native session
+# verification does not use this retry setting.
 mojang-retry-count: 3
 # Base delay between retries in milliseconds (exponential backoff: delay * 2^(attempt-1), capped at 10s)
 mojang-retry-delay: 500
@@ -184,18 +153,19 @@ mojang-retry-delay: 500
 ip-addresses:
 
 # Max Mojang name->UUID requests per 10 minutes
-# Mojang allows 600 requests per 10 minutes per outgoing IPv4 address. Lower this to
-# leave room for other plugins, or raise it while using 'proxies' below. Valid range
-# 0..600, other values are clamped. 0 means "never call Mojang directly" and requires
-# at least one proxy entry; without one the value is reset to 600.
+# Range: 0..600 per outgoing IP. Values are clamped; 0 disables direct requests
+# and requires at least one HTTP proxy below, otherwise the limit resets to 600.
 mojang-request-limit: 600
 
 # ========================================
 # Floodgate / Bedrock
 # ========================================
+# Fabric only supports auto-login for qualifying unlinked Floodgate players
+# with existing EasyAuth accounts. Auto-registration and linked login are not
+# supported on Fabric, regardless of these proxy settings.
 # Auto-login for Floodgate (Bedrock) players. Values: false / true / linked / no-conflict
 # The proxy handles Bedrock players.
-autoLoginFloodgate: false
+autoLoginFloodgate: true
 
 # Allow Bedrock players to join even if their name conflicts with a Java premium account
 # Enforced by the proxy.
@@ -228,13 +198,8 @@ password: 'myPassword'
 # timeout: how long an operation waits to obtain a connection from the pool
 # before failing (HikariCP connectionTimeout)
 timeout: 30
-# lifetime: how long a pooled connection lives before the pool retires and
-# replaces it (HikariCP maxLifetime).
-# Recommended: 1800 (30 minutes — the HikariCP default): long enough to
-# amortize TCP/auth/TLS handshake costs, short enough to retire connections
-# before the server kills them — keep it BELOW your MySQL wait_timeout
-# (default 8h). Values below 300 are clamped to 300 with a startup warning
-# (shorter lifetimes make the pool constantly reconnect); 0 = never expire.
+# lifetime: connection lifetime in seconds. Keep it below MySQL wait_timeout.
+# Values below 300 are clamped to 300; 0 disables expiry.
 lifetime: 1800
 
 # SSL for MySQL (only used when driver: 'mysql')

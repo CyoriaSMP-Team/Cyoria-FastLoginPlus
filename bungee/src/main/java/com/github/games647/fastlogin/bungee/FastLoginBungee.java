@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bungee;
 
@@ -39,6 +20,7 @@ import org.slf4j.Logger;
 
 import com.github.games647.fastlogin.bungee.hook.BungeeAuthHook;
 import com.github.games647.fastlogin.bungee.listener.ConnectListener;
+import com.github.games647.fastlogin.bungee.listener.CrackedNoticeDelivery;
 import com.github.games647.fastlogin.bungee.listener.PluginMessageListener;
 import com.github.games647.fastlogin.core.CommonUtil;
 import com.github.games647.fastlogin.core.hooks.AuthPlugin;
@@ -56,6 +38,7 @@ import com.github.games647.fastlogin.core.shared.AuthMeProxyConfig;
 import com.github.games647.fastlogin.core.shared.AuthMeProxyPin;
 import com.github.games647.fastlogin.core.shared.FastLoginCore;
 import com.github.games647.fastlogin.core.shared.PlatformPlugin;
+import com.github.games647.fastlogin.protocol.CrackedNoticeWire;
 import com.google.common.collect.MapMaker;
 import com.google.common.io.ByteArrayDataOutput;
 import com.google.common.io.ByteStreams;
@@ -90,6 +73,7 @@ public class FastLoginBungee extends Plugin implements PlatformPlugin<CommandSen
 
     private FastLoginCore<ProxiedPlayer, CommandSender, FastLoginBungee> core;
     private AsyncScheduler scheduler;
+    private CrackedNoticeDelivery crackedNoticeDelivery;
     private FloodgateService floodgateService;
     private GeyserService geyserService;
     private Logger logger;
@@ -104,6 +88,10 @@ public class FastLoginBungee extends Plugin implements PlatformPlugin<CommandSen
         core.setConfigTemplate("config-proxy.yml");
         core.load();
         if (!core.setupDatabase()) {
+            // BungeeCord cannot disable a plugin from onEnable; say plainly that
+            // the plugin stays loaded but will not function
+            getLog().error("FastLoginPlus is not active: the database could not be initialised. "
+                    + "Fix the configuration and restart the proxy.");
             return;
         }
 
@@ -123,11 +111,14 @@ public class FastLoginBungee extends Plugin implements PlatformPlugin<CommandSen
         Listener connectListener = new ConnectListener(this, core.getAntiBotService());
         pluginManager.registerListener(this, connectListener);
         pluginManager.registerListener(this, new PluginMessageListener(this));
+        crackedNoticeDelivery = new CrackedNoticeDelivery(this);
+        pluginManager.registerListener(this, crackedNoticeDelivery);
 
         //this is required to listen to incoming messages from the server
         getProxy().registerChannel(NamespaceKey.getCombined(getName(), ChangePremiumMessage.CHANGE_CHANNEL));
         getProxy().registerChannel(NamespaceKey.getCombined(getName(), SuccessMessage.SUCCESS_CHANNEL));
         getProxy().registerChannel(NamespaceKey.getCombined(getName(), DeletePremiumMessage.DELETE_CHANNEL));
+        getProxy().registerChannel(NamespaceKey.getCombined(getName(), CrackedNoticeWire.CHANNEL));
 
         registerHook();
         scheduleUpdateCheck();
@@ -137,11 +128,15 @@ public class FastLoginBungee extends Plugin implements PlatformPlugin<CommandSen
     public void onDisable() {
         // stop scheduling before closing shared resources
         scheduler.shutdown();
+        // in-flight storage tasks may still be writing — let them finish
+        // before core.close() shuts the database pool down underneath them
+        scheduler.awaitQuiescence(Duration.ofSeconds(3));
         // release the global channel registrations so a reload
         // does not leak them
         getProxy().unregisterChannel(NamespaceKey.getCombined(getName(), ChangePremiumMessage.CHANGE_CHANNEL));
         getProxy().unregisterChannel(NamespaceKey.getCombined(getName(), SuccessMessage.SUCCESS_CHANNEL));
         getProxy().unregisterChannel(NamespaceKey.getCombined(getName(), DeletePremiumMessage.DELETE_CHANNEL));
+        getProxy().unregisterChannel(NamespaceKey.getCombined(getName(), CrackedNoticeWire.CHANNEL));
 
         if (core != null) {
             core.close();
@@ -154,6 +149,10 @@ public class FastLoginBungee extends Plugin implements PlatformPlugin<CommandSen
 
     public ConcurrentMap<PendingConnection, BungeeLoginSession> getSession() {
         return session;
+    }
+
+    public CrackedNoticeDelivery getCrackedNoticeDelivery() {
+        return crackedNoticeDelivery;
     }
 
     private void registerHook() {

@@ -1,27 +1,8 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * The MIT License (MIT)
- *
- * Copyright (c) 2015-2026 games647, Hayston and contributors
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (c) 2026 games647 and contributors
+ * Copyright (c) 2026 Hayston1001
  */
 package com.github.games647.fastlogin.bukkit;
 
@@ -58,6 +39,7 @@ import com.github.games647.fastlogin.bukkit.command.FlpCommand;
 import com.github.games647.fastlogin.bukkit.listener.AuthMeCommandGuard;
 import com.github.games647.fastlogin.bukkit.listener.AuthMeTakeoverListener;
 import com.github.games647.fastlogin.bukkit.listener.ConnectionListener;
+import com.github.games647.fastlogin.bukkit.listener.FloodgatePreLoginListener;
 import com.github.games647.fastlogin.bukkit.listener.protocollib.ProtocolLibListener;
 import com.github.games647.fastlogin.bukkit.listener.protocolsupport.ProtocolSupportListener;
 import com.github.games647.fastlogin.bukkit.listener.UpdateNotifyListener;
@@ -88,6 +70,13 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
     );
 
     private final Map<UUID, PremiumStatus> premiumPlayers = new ConcurrentHashMap<>();
+    /** Claim nonces already admitted in the current freshness window. */
+    private static final com.github.games647.fastlogin.protocol.IdentityClaimReplayCache
+            IDENTITY_CLAIM_REPLAY_CACHE =
+            new com.github.games647.fastlogin.protocol.IdentityClaimReplayCache();
+    /** Kick messages for logins refused during the configuration phase. */
+    private final java.util.concurrent.ConcurrentMap<String, String> pendingKicks =
+            new ConcurrentHashMap<>();
     private final Map<UUID, FloodgateState> playerFloodgateState = new ConcurrentHashMap<>();
 
     /**
@@ -106,6 +95,15 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
      * that never reaches configuration leaves at most one stale entry behind.
      */
     private final ConcurrentMap<String, UUID> preLoginAttestations = new ConcurrentHashMap<>();
+    private final ProxyBedrockPreLogin proxyBedrockPreLogin = new ProxyBedrockPreLogin(this);
+
+    public ProxyBedrockPreLogin getProxyBedrockPreLogin() {
+        return proxyBedrockPreLogin;
+    }
+
+    public boolean hasBackendFloodgate() {
+        return getFloodgateService() != null;
+    }
 
     /**
      * How long an administrator's {@code /flp cracked} keeps suppressing premium marking for the
@@ -125,6 +123,12 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
     private final ConcurrentMap<String, Long> crackedOverrides = new ConcurrentHashMap<>();
     private final Logger logger;
 
+    private void debugLog(String message, Object... arguments) {
+        if (core.isDebug()) {
+            logger.info(message, arguments);
+        }
+    }
+
     private boolean serverStarted;
     private BungeeManager bungeeManager;
     private final FoliaScheduler scheduler;
@@ -135,11 +139,13 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
     // dead plugin instances)
     private final AtomicBoolean relayChainsRunning = new AtomicBoolean(true);
 
-    // true once FLP forced AuthMe's enablePremium and removed AuthMe's own
-    // premium packet listener. AuthMe's /premium and /freemium stay executable in that
+    // True once FLP took over packet verification. On proxy backends the persisted
+    // premium flag is left untouched until a policy is declared. AuthMe's commands stay executable in that
     // state but no longer converge with FLP's profile, so AuthMeCommandGuard intercepts
     // them for players who could actually run them.
     private boolean premiumTakeoverActive;
+    // Unsupported AuthMe builds fail the proxy pin; warn once instead of on every reassert.
+    private boolean authMeProxyPinWarningLogged;
 
     // give up relaying after ~5 minutes (1s interval) and keep the
     // entry queued instead of retrying forever
@@ -177,19 +183,6 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
             authMePremiumIntegrator = new AuthMePremiumIntegrator(this, authMeVersionDetector);
             if (authMeVersionDetector.isAuthMe6()) {
                 logger.info("AuthMe 6.0+ detected: v{}", authMeVersionDetector.getVersion());
-
-                // FLP takes over premium verification: force enablePremium=true
-                // (persisted to AuthMe's config.yml) and unregister AuthMe's
-                // redundant PremiumVerificationPacketListener so FLP's ProtocolLib
-                // listener is the sole Mojang verification source.
-                // surface partial failures — AuthMe's packet listener may
-                // still be registered, causing a double-interception conflict
-                premiumTakeoverActive = authMePremiumIntegrator.enforceFlpPremiumControl();
-                if (!premiumTakeoverActive) {
-                    logger.warn("Failed to fully enforce FastLogin premium control in AuthMe 6.0"
-                            + " — premium logins may conflict with AuthMe's own listener");
-                }
-
             } else {
                 logger.info("AuthMe 5.x detected: v{} — using standard FLP flow",
                     authMeVersionDetector.getVersion());
@@ -212,6 +205,16 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
 
         bungeeManager = new BungeeManager(this);
         bungeeManager.initialize();
+
+        // Proxy mode must be known before takeover: preserve its stored flag until trusted facts arrive.
+        if (authMePremiumIntegrator != null && authMeVersionDetector.isAuthMe6()) {
+            premiumTakeoverActive = authMePremiumIntegrator.enforceFlpPremiumControl(bungeeManager.isEnabled());
+            pinAuthMeProxyAutoLoginOff();
+            if (!premiumTakeoverActive) {
+                logger.warn("Failed to fully enforce FastLogin premium control in AuthMe 6.0"
+                        + " — premium logins may conflict with AuthMe's own listener");
+            }
+        }
 
         // AuthMe's own verification is off while its command layer stays
         // registered. Direct connections only — see the method's javadoc. Proxy mode is part of
@@ -248,7 +251,7 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
 
             AntiBotService antiBotService = core.getAntiBotService();
             if (pluginManager.isPluginEnabled("ProtocolSupport")) {
-                pluginManager.registerEvents(new ProtocolSupportListener(this, antiBotService), this);
+                ProtocolSupportListener.register(this, antiBotService);
             } else if (pluginManager.isPluginEnabled("ProtocolLib")) {
                 ProtocolLibListener.register(this, antiBotService, core.getConfig().getBoolean("verifyClientKeys"));
             } else {
@@ -264,14 +267,20 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
         ConnectionListener connectionListener = new ConnectionListener(this);
         pluginManager.registerEvents(connectionListener, this);
 
-        if (bungeeManager.isEnabled()) {
-            org.bukkit.event.player.PlayerLoginEvent.getHandlerList().unregister(connectionListener);
-            logger.info("Unregistered PlayerLoginEvent listener to avoid HorriblePlayerLoginEventHack");
-        }
+        // PlayerLoginEvent is Spigot-only: any listener disables Paper's configure API
+        // through HorriblePlayerLoginEventHack. Folia is Paper-based, even without a proxy.
+        // Startup is checked in async pre-login; pending login/kick delivery remains at join time.
+        org.bukkit.event.player.PlayerLoginEvent.getHandlerList().unregister(connectionListener);
+        logger.info("Unregistered PlayerLoginEvent listener to avoid HorriblePlayerLoginEventHack");
 
         registerPaperConfigureListener();
 
-        // Folia is based on Paper — register PaperCacheListener to set skin during
+        // Capture proxy Bedrock declarations before the optional backend Floodgate
+        // compatibility listener, so backend policy cannot override declared policy.
+        registerBedrockListeners(pluginManager);
+
+        // Folia startup/admission checks run here instead of PlayerLoginEvent.
+        // Folia is based on Paper - register PaperCacheListener to set skin during
         // AsyncPlayerPreLoginEvent before profile.complete(true) pulls from filledProfileCache.
         // forwardSkin is checked inside the listener — when false, skin setting is skipped.
         pluginManager.registerEvents(
@@ -368,17 +377,33 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
      * it is running.
      */
     private void registerAuthMeTakeoverListener() {
-        if (!premiumTakeoverActive) {
+        if (authMePremiumIntegrator == null || authMeVersionDetector == null || !authMeVersionDetector.isAuthMe6()) {
             return;
         }
 
         getServer().getPluginManager().registerEvents(new AuthMeTakeoverListener(this), this);
-        if (!bungeeManager.isEnabled()
+        if (premiumTakeoverActive && !bungeeManager.isEnabled()
                 && getServer().getPluginManager().isPluginEnabled("packetevents")) {
             // only true here: on a proxy backend AuthMe never registers that listener, and
             // without the packet library it cannot
             logger.info("Took over AuthMe's premium packet verification — FLP is the sole "
                     + "Mojang verification source on this server");
+        }
+    }
+
+    /**
+     * Applies FLP's AuthMe proxy auto-login pin and reports a failure to the administrator.
+     *
+     * <p>A {@code false} result means the pin was skipped, for example on an AuthMe version FLP
+     * has not reviewed. Upstream's proxy login receiver may then stay active, so this warns
+     * once: the AuthMe version does not change between reasserts and a reload would otherwise
+     * repeat the same line.
+     */
+    private void pinAuthMeProxyAutoLoginOff() {
+        if (!authMePremiumIntegrator.pinProxyAutoLoginOff() && !authMeProxyPinWarningLogged) {
+            authMeProxyPinWarningLogged = true;
+            logger.warn("AuthMe proxy auto-login pin was not applied; "
+                    + "upstream proxy SSO may remain enabled.");
         }
     }
 
@@ -392,16 +417,28 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
      * the same thread as the startup call, because AuthMe's packet-listener registry is not
      * verified to be thread-safe.
      *
-     * <p>Silent and cheap when AuthMe's listener cannot exist on this server (proxy backend, or no
-     * packet library): there is nothing to keep removed, so nothing is logged and no task is
-     * scheduled. Only reachable while the takeover is active — the listener is registered under
-     * that condition.
+     * <p>Proxy backends instead reapply the last declared policy and refresh its consumers.
+     * This assumes AuthMe completes its synchronous reload before the next tick. A connection
+     * during that gap, or an asynchronously reloaded fork, still needs real-server validation.
      *
      * @param reason short description of the triggering event, used in the log line
      */
     public void reassertAuthMeTakeover(String reason) {
-        if (authMePremiumIntegrator == null || bungeeManager == null || bungeeManager.isEnabled()
-                || !getServer().getPluginManager().isPluginEnabled("packetevents")) {
+        if (authMePremiumIntegrator == null || bungeeManager == null) {
+            return;
+        }
+        if (bungeeManager.isEnabled()) {
+            Bukkit.getGlobalRegionScheduler().runDelayed(this, task -> {
+                pinAuthMeProxyAutoLoginOff();
+                if (authMePremiumIntegrator.hasProxyAutoLoginPolicy()) {
+                    authMePremiumIntegrator.reassertProxyAutoLogin();
+                }
+            }, 1L);
+            return;
+        }
+        Bukkit.getGlobalRegionScheduler().runDelayed(this,
+                task -> pinAuthMeProxyAutoLoginOff(), 1L);
+        if (!getServer().getPluginManager().isPluginEnabled("packetevents")) {
             return;
         }
 
@@ -511,6 +548,9 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
         scheduler.shutdown();
         // stop the self-chaining relay retry tasks
         relayChainsRunning.set(false);
+        // in-flight storage tasks may still be writing — let them finish
+        // before core.close() shuts the database pool down underneath them
+        scheduler.awaitQuiescence(Duration.ofSeconds(3));
 
         if (core != null) {
             core.close();
@@ -538,8 +578,8 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
     }
 
     /**
-     * Whether FLP has taken over AuthMe's premium handling: {@code enablePremium} was forced
-     * to true and AuthMe's own premium packet listener was removed.
+     * Whether FLP has taken over AuthMe's packet verification. Standalone startup enables
+     * premium; proxy startup preserves the stored flag until a trusted policy arrives.
      *
      * @return true if the AuthMe 6.0 takeover succeeded at startup
      */
@@ -647,6 +687,14 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
         return geyserService;
     }
 
+    void registerBedrockListeners(PluginManager pluginManager) {
+        pluginManager.registerEvents(
+                new com.github.games647.fastlogin.bukkit.listener.ProxyBedrockPreLoginListener(this), this);
+        if (hasBackendFloodgate()) {
+            pluginManager.registerEvents(new FloodgatePreLoginListener(this), this);
+        }
+    }
+
     private void registerPaperConfigureListener() {
         logger.info("Attempting to register Paper configure listener...");
         try {
@@ -670,9 +718,28 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
         }
     }
 
+    private boolean handleProxyBedrockConfigure(Object event) {
+        try {
+            Object connection = event.getClass().getMethod("getConnection").invoke(event);
+            Object profile = connection.getClass().getMethod("getProfile").invoke(connection);
+            String name = (String) profile.getClass().getMethod("getName").invoke(profile);
+            UUID uuid = (UUID) profile.getClass().getMethod("getId").invoke(profile);
+            java.net.SocketAddress raw = (java.net.SocketAddress) connection.getClass()
+                    .getMethod("getAddress").invoke(connection);
+            return proxyBedrockPreLogin.configure(profile, name, uuid, raw);
+        } catch (ReflectiveOperationException failure) {
+            debugLog("Could not read proxy Bedrock configure profile (errorType={})",
+                    failure.getClass().getSimpleName());
+            return false;
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private void onPlayerConfigure(Object event) {
-        if (!bungeeManager.isEnabled() || !getConfig().getBoolean("autoRegister")) {
+        if (bungeeManager.isEnabled() && handleProxyBedrockConfigure(event)) {
+            return;
+        }
+        if (!runsProxyPremiumPath(bungeeManager.isEnabled(), getConfig().getBoolean("autoRegister"))) {
             return;
         }
 
@@ -686,6 +753,8 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
         // Null when absent — cracked login, Floodgate, BungeeCord (no injection point) or an
         // older proxy.
         UUID forwardedPremiumUuid = null;
+        com.github.games647.fastlogin.protocol.IdentityClaim.Facts identityFacts = null;
+        com.github.games647.fastlogin.protocol.IdentityClaim identityDeclaration = null;
         try {
             connection = event.getClass().getMethod("getConnection").invoke(event);
             Object profile = connection.getClass().getMethod("getProfile").invoke(connection);
@@ -694,6 +763,8 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
             address = (java.net.InetSocketAddress) connection.getClass()
                 .getMethod("getClientAddress").invoke(connection);
             forwardedPremiumUuid = readForwardedPremiumUuid(profile);
+            identityDeclaration = readIdentityDeclaration(profile, playerName, connectionUuid);
+            identityFacts = identityDeclaration == null ? null : identityDeclaration.getFacts();
             // an attestation only counts when this very login already carried it,
             // before Paper's profile cache could have supplied a stale profile.
             UUID configureAttestation = forwardedPremiumUuid;
@@ -709,17 +780,34 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
             return;
         }
 
+        synchronizeAuthMePremiumPolicy(identityFacts);
+
+        final boolean trustedAttestation = trustsPremiumAttestation(playerName, identityDeclaration,
+                forwardedPremiumUuid != null
+                        || usesForwardedUuidAttestation(null, connectionUuid, playerName));
+        if (!trustedAttestation) {
+            forwardedPremiumUuid = null;
+        }
+
+        // Explicit OFFLINE wins over attestation, lookup and pending-toggle shortcuts.
+        if (identityDeclaration != null && identityDeclaration.getDecision()
+                == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE) {
+            allowsIdentityLogin(playerName, false, identityFacts, connection, address, null, connectionUuid);
+            return;
+        }
+
         // Pending toggles — cracked skips, premium allows despite UUID mismatch.
         // Cracked: the queued relay STAYS pending and is delivered by the retry
         // task once any player reaches the PLAY phase.
         Boolean pendingActivate = pendingRelayStore.getToggle(playerName);
-        final boolean isPendingPremium = Boolean.TRUE.equals(pendingActivate);
+        final boolean isPendingPremium = pendingRelayStore.isRecentPremiumToggle(
+                playerName, PendingRelayStore.PENDING_PREMIUM_RELAXATION_MILLIS);
         if (pendingActivate != null && !pendingActivate) {
             // The queued cracked toggle must still reach the proxy (its DB is
             // still premium) — do NOT consume the entry here.  Only skip the
             // AuthMe autoRegister; the message is delivered later by the retry
             // task (remove-if-present guards against double-send).
-            logger.info("Skipping autoRegister for {}: pending cracked toggle (relay stays queued)",
+            debugLog("Skipping autoRegister for {}: pending cracked toggle (relay stays queued)",
                     playerName);
             // defensive: make sure a relay task exists for the still-queued entry
             scheduleToggleRelay(playerName);
@@ -731,32 +819,34 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
         // Run the whole auto-register synchronously: no Mojang lookup to wait for, so AuthMe's
         // HIGHEST handler cannot show a dialog first. The UUID-equality guard below does not
         // apply: a mismatch is the entire point of premiumUuid:false, and the attestation came
-        // from the proxy (HMAC-protected by the forwarding secret), not from a name lookup.
+        // from authenticated forwarding or the validated legacy declaration, not from a name lookup.
         if (forwardedPremiumUuid != null) {
-            logger.info("Proxy attested {} as premium ({}) in the configure phase",
+            debugLog("Proxy attested {} as premium ({}) in the configure phase",
                     playerName, forwardedPremiumUuid);
             applyPremiumAtConfigure(playerName, forwardedPremiumUuid, connectionUuid,
-                    connection, address, isPendingPremium);
+                    connection, address, isPendingPremium, identityFacts);
             return;
         }
 
         // with premiumUuid: true the proxy keeps the Mojang UUID and therefore attaches
         // no attestation property (see the Velocity ConnectListener), so the attestation is the
-        // UUID itself — an offline UUID is always version 3, so a version-4 connection UUID can
-        // only have come from the proxy. Mark the record synchronously here, exactly like the
+        // UUID itself, but its v4 shape is only a signal after the transport/declaration gate.
+        // Mark the record synchronously here, exactly like the
         // property path above: the asynchronous Mojang lookup below is what used to let AuthMe's
         // HIGHEST handler open its preJoin dialog before the record existed, which the player saw
         // as the dialog staying on screen for the length of that lookup. The same structural
         // signal already drives the pre-login path on Spigot, where this phase does not exist.
-        if (usesForwardedUuidAttestation(forwardedPremiumUuid, connectionUuid, playerName)) {
-            logger.info("Proxy forwarded the Mojang UUID {} for {} in the configure phase — "
+        if (trustedAttestation
+                && usesForwardedUuidAttestation(forwardedPremiumUuid, connectionUuid, playerName)) {
+            debugLog("Proxy forwarded the Mojang UUID {} for {} in the configure phase — "
                     + "marking the AuthMe record synchronously (no Mojang lookup needed)",
                     connectionUuid, playerName);
             applyPremiumAtConfigure(playerName, connectionUuid, connectionUuid,
-                    connection, address, isPendingPremium);
+                    connection, address, isPendingPremium, identityFacts);
             return;
         }
 
+        final com.github.games647.fastlogin.protocol.IdentityClaim.Facts declaredFacts = identityFacts;
         scheduler.runAsync(() -> {
             try {
                 java.util.Optional<com.github.games647.craftapi.model.Profile> mojang =
@@ -778,21 +868,26 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
                         // the proxy hands out the offline UUID — a cracked player, or a premium
                         // player under premiumUuid:false on a fallback path (Bungee, or a proxy
                         // too old for the profile attestation); it is not a failure.
-                        logger.info(
+                        debugLog(
                             "Skipping autoRegister for {}: connection UUID {} != premium UUID {}"
                                 + " (expected when the proxy assigns the offline UUID — a cracked"
                                 + " player, or premiumUuid:false)",
                             playerName, connectionUuid, premiumUuid);
                         return;
                     }
-                    logger.info(
+                    debugLog(
                         "Pending premium toggle for {}: allowing autoRegister "
                             + "despite UUID mismatch ({} vs {})",
                         playerName, connectionUuid, premiumUuid);
                 }
 
+                // A public name lookup cannot authenticate an unsigned connection or repair
+                // a rejected attestation, even when the supplied UUID happens to match.
+                if (!trustedAttestation) {
+                    return;
+                }
                 applyPremiumAtConfigure(playerName, premiumUuid, connectionUuid,
-                        connection, address, isPendingPremium);
+                        connection, address, isPendingPremium, declaredFacts);
             } catch (Exception e) {
                 logger.warn("AutoRegister in configure phase failed for {}: {}",
                     playerName, e.getMessage());
@@ -856,6 +951,19 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
                 && ProxyForwardedUuid.isForwardedMojangUuid(connectionUuid, playerName);
     }
 
+    private boolean trustsPremiumAttestation(String playerName,
+            com.github.games647.fastlogin.protocol.IdentityClaim declaration, boolean hasAttestation) {
+        if (bungeeManager.isSignedForwarding() || declaration != null) {
+            return true;
+        }
+        if (hasAttestation) {
+            logger.warn("Ignoring premium attestation for {}: unsigned forwarding has no validated "
+                    + "flp_identity bound to this connection with an allowed proxy ID; "
+                    + "name lookup cannot authenticate it, waiting for a trusted late message", playerName);
+        }
+        return false;
+    }
+
     /**
      * Marks the player as premium in AuthMe and seeds the login session, all inside the
      * configuration phase so AuthMe's preJoin dialogs are closed before they are created.
@@ -867,23 +975,40 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
      * @param connection the Paper connection object, for AuthMe's dialog session lookup
      * @param address the client address the session is keyed by
      * @param isPendingPremium whether a premium toggle is queued for relay
+     * @param facts the proxy's declared identity facts, or null when none were declared
      */
     private void applyPremiumAtConfigure(String playerName, java.util.UUID premiumUuid,
                                          java.util.UUID connectionUuid, Object connection,
                                          java.net.InetSocketAddress address,
-                                         boolean isPendingPremium) {
+                                         boolean isPendingPremium,
+                                         com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts) {
+        // the proxy attested this connection as premium: it refutes any pending
+        // same-name cracked suspicion for the name, even if the decision below
+        // then rejects the login
+        getCore().resetVerificationState(playerName);
+
+        // Login-method decision: the account state plus the declared facts
+        // decide, never the attestation alone. A missing or untrusted declaration
+        // leaves the consent unknown, which never unlocks a password account.
+        if (!allowsPremiumLogin(playerName, facts, connection, address, premiumUuid, connectionUuid)) {
+            return;
+        }
+
         // an administrator's /flp cracked wins over a premium marking that is still in
         // flight. Skipping here is what stops the async task from re-creating the record the
         // command just deleted.
         if (isCrackedOverrideActive(System.currentTimeMillis(), crackedOverrides.get(playerName),
                 CRACKED_OVERRIDE_TTL_MILLIS)) {
-            logger.info("Skipping premium marking for {}: an administrator switched this player "
+            debugLog("Skipping premium marking for {}: an administrator switched this player "
                     + "to cracked", playerName);
             return;
         }
 
         com.github.games647.fastlogin.bukkit.compat.AuthMePremiumIntegrator integrator =
             getAuthMePremiumIntegrator();
+        // Registration policy lives in allowsPremiumLogin()/LoginMethodDecider
+        // (real AuthMe account state); re-checking it here with a second,
+        // possibly divergent read would veto proxy-attested logins.
         if (integrator != null && integrator.isAuthMePremiumEnabled()) {
             integrator.injectVerifiedUuid(playerName, premiumUuid);
             integrator.markPlayerAsPremium(playerName, premiumUuid);
@@ -894,9 +1019,8 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
             integrator.closePreJoinLoginDialog(connectionUuid, connection);
         }
 
-        BukkitLoginSession session = new BukkitLoginSession(playerName, true);
-        session.setUuid(premiumUuid);
-        session.setVerifiedPremium(true);
+        BukkitLoginSession session = newPremiumSession(playerName, premiumUuid, facts);
+        session.setConnectionUuid(connectionUuid);
         putSession(address, session);
 
         if (isPendingPremium) {
@@ -937,6 +1061,424 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
                 }, null);
             }
         }
+    }
+
+    /**
+     * Reads the proxy's identity facts from the forwarded profile (the early
+     * channel). Trust depends on the chain: signature-protected forwarding
+     * (Velocity modern forwarding) proves the declaration already, while legacy
+     * forwarding (BungeeCord) is unsigned, so its claims must carry this proxy's
+     * ID token and pass the proxy allowlist. Invalid claims provide no facts.
+     * Unsigned v4 connections additionally require a valid claim at admission.
+     *
+     * @param profile        the forwarded profile
+     * @param playerName     the logging-in player's name
+     * @param connectionUuid the connection UUID the claim must bind to
+     * @return the full declaration, or null when nothing trustworthy was declared
+     */
+    private com.github.games647.fastlogin.protocol.IdentityClaim readIdentityDeclaration(
+            Object profile, String playerName, java.util.UUID connectionUuid) {
+        return readIdentityDeclaration(profile, playerName, connectionUuid, false);
+    }
+
+    private com.github.games647.fastlogin.protocol.IdentityClaim readIdentityDeclaration(
+            Object profile, String playerName, java.util.UUID connectionUuid, boolean consumeNonce) {
+        try {
+            SpigotProfileReader.Snapshot snapshot = SpigotProfileReader.readProfile(profile, "profile");
+            return validateIdentityDeclaration(snapshot.claims, snapshot.signatures, playerName,
+                    connectionUuid, consumeNonce);
+        } catch (Exception untrustworthy) {
+            return null;
+        }
+    }
+
+    private com.github.games647.fastlogin.protocol.IdentityClaim validateIdentityDeclaration(
+            java.util.List<String> values, String playerName, UUID connectionUuid) {
+        return validateIdentityDeclaration(values, java.util.Collections.emptyList(), playerName,
+                connectionUuid, false);
+    }
+
+    private com.github.games647.fastlogin.protocol.IdentityClaim validateIdentityDeclaration(
+            java.util.List<String> values, java.util.List<String> signatures, String playerName,
+            UUID connectionUuid, boolean consumeNonce) {
+        try {
+            com.github.games647.fastlogin.protocol.IdentityClaim claim =
+                    com.github.games647.fastlogin.protocol.IdentityClaim.parseExactlyOne(
+                            values, playerName, connectionUuid);
+            if (!bungeeManager.isSignedForwarding()) {
+                if (signatures.size() != 1) {
+                    return null;
+                }
+                boolean verified = false;
+                for (UUID proxyId : bungeeManager.getAllowedProxyIds()) {
+                    verified |= com.github.games647.fastlogin.protocol.IdentityClaim.verifySignature(
+                            values.get(0), signatures.get(0), proxyId);
+                }
+                if (!verified) {
+                    return null;
+                }
+                // Legacy forwarding has no transport authentication, so a claim
+                // without the freshness fields could be replayed indefinitely.
+                if (!claim.hasFreshness()) {
+                    logger.warn("Refusing identity claim for {}: legacy forwarding requires a fresh claim. "
+                            + "Update the proxy.", playerName);
+                    return null;
+                }
+            }
+            if (claim.hasFreshness()) {
+                long now = System.currentTimeMillis();
+                if (!claim.isFresh(now)) {
+                    logger.warn("Refusing stale identity claim for {}", playerName);
+                    return null;
+                }
+                // consume only at admission: the same claim is read again in later phases
+                if (consumeNonce && !IDENTITY_CLAIM_REPLAY_CACHE.register(claim.getNonce(), now)) {
+                    logger.warn("Refusing replayed identity claim for {}", playerName);
+                    return null;
+                }
+            }
+            return claim;
+        } catch (Exception untrustworthy) {
+            // No claim, a malformed one, or one bound to another profile supplies no facts.
+            return null;
+        }
+    }
+
+    /**
+     * Pure admission decision for the UUID branch AuthMe trusts as premium.
+     *
+     * @param proxyMode whether this server is a proxy backend
+     * @param signedForwarding whether forwarding authenticates the connection
+     * @param connectionUuid the UUID carried by this connection
+     * @param trustedClaim whether exactly one connection-bound claim passed validation
+     * @return whether the connection must be refused before AuthMe handles it
+     */
+    static boolean isUntrustedPremiumConnection(boolean proxyMode, boolean signedForwarding,
+            UUID connectionUuid, boolean trustedClaim) {
+        return proxyMode && !signedForwarding && connectionUuid != null
+                && connectionUuid.version() == 4 && !trustedClaim;
+    }
+
+    /**
+     * Rejects unsigned premium UUIDs before AuthMe can trust the handshake UUID.
+     *
+     * @param profile the current connection's forwarded profile
+     * @param playerName the logging-in name
+     * @param connectionUuid the connection UUID
+     * @return whether admission must be refused
+     */
+    public boolean isUntrustedPremiumConnection(Object profile, String playerName, UUID connectionUuid) {
+        if (proxyBedrockPreLogin.hasTrustedDeclaration(playerName, connectionUuid)) {
+            return false;
+        }
+        if (!isUntrustedPremiumConnection(bungeeManager.isEnabled(), bungeeManager.isSignedForwarding(),
+                connectionUuid, false)) {
+            return false;
+        }
+        return rejectUntrustedPremiumConnection(playerName, connectionUuid,
+                readIdentityDeclaration(profile, playerName, connectionUuid, true));
+    }
+
+    private boolean rejectUntrustedPremiumConnection(String playerName, UUID connectionUuid,
+            com.github.games647.fastlogin.protocol.IdentityClaim claim) {
+        // A valid signature must also prove this connection's premium identity.
+        boolean trustedClaim = claim != null
+                && claim.getDecision()
+                        == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.PREMIUM_VERIFIED
+                && connectionUuid != null
+                && connectionUuid.equals(claim.getVerifiedMojangUuid());
+        boolean rejected = isUntrustedPremiumConnection(bungeeManager.isEnabled(),
+                bungeeManager.isSignedForwarding(), connectionUuid, trustedClaim);
+        if (rejected) {
+            logger.warn("Refusing login for {} with connection UUID {}: no signature matched any of the {} "
+                    + "loaded proxy IDs, or the signed claim did not prove this connection's premium identity. "
+                    + "Restart the backend if allowed-proxies.txt changed.",
+                    playerName, connectionUuid, bungeeManager.getAllowedProxyIds().size());
+        }
+        return rejected;
+    }
+
+    /**
+     * Whether the premium path runs for proxy-forwarded logins (the configure
+     * phase on Paper, the pre-login pre-create on Spigot). Behind a proxy the
+     * login policy arrives with the identity facts, so this server's local
+     * autoRegister copy never gates the path — config.yml marks that copy
+     * "ignored here" and only standalone deployments read it. The local value is
+     * a parameter only to keep that contract visible and pinned where it is
+     * decided.
+     *
+     * @param proxyMode           whether this server is a proxy backend
+     * @param localAutoRegister   this server's local autoRegister copy (deliberately ignored)
+     * @return true when the premium path handles this login
+     */
+    static boolean runsProxyPremiumPath(boolean proxyMode, boolean localAutoRegister) {
+        return proxyMode;
+    }
+
+    /**
+     * The login-method decision behind the configure-phase premium grant:
+     * the account state plus the declared facts, never the attestation alone.
+     *
+     * @param playerName the logging-in player's name
+     * @param facts      the declared facts, or null when none were declared
+     * @return true when the premium path may handle this login
+     */
+    private boolean allowsPremiumLogin(String playerName,
+            com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts) {
+        return allowsPremiumLogin(playerName, facts, null, null);
+    }
+
+    private boolean allowsPremiumLogin(String playerName,
+            com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts,
+            Object connection, java.net.InetSocketAddress address) {
+        return allowsPremiumLogin(playerName, facts, connection, address, null, null);
+    }
+
+    private boolean allowsPremiumLogin(String playerName,
+            com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts,
+            Object connection, java.net.InetSocketAddress address, UUID verifiedPremiumUuid, UUID connectionUuid) {
+        return allowsIdentityLogin(playerName, true, facts, connection, address, verifiedPremiumUuid, connectionUuid);
+    }
+
+    /**
+     * Synchronizes only policy facts already validated by a proxy channel.
+     * Paper/Folia call this before AuthMe's configure handler. Bukkit's Spigot deployment can
+     * additionally use its live PlayerLoginEvent profile; late trusted messages remain a fallback.
+     *
+     * @param facts trusted declared facts, or null/undeclared for a legacy proxy
+     */
+    public void synchronizeAuthMePremiumPolicy(
+            com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts) {
+        if (facts != null && facts.policyDeclared() && authMePremiumIntegrator != null
+                && bungeeManager != null && bungeeManager.isEnabled()) {
+            authMePremiumIntegrator.applyProxyAutoLogin(facts.autoLogin());
+        }
+    }
+
+    private boolean allowsIdentityLogin(String playerName, boolean verified,
+            com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts,
+            Object connection, java.net.InetSocketAddress address, UUID verifiedPremiumUuid, UUID connectionUuid) {
+        com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState account;
+        try {
+            com.github.games647.fastlogin.core.hooks.AuthPlugin<Player> authPlugin = core.getAuthPluginHook();
+            account = authPlugin == null
+                    ? com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.NONE
+                    : authPlugin.inspectAccount(playerName);
+        } catch (Exception readError) {
+            account = com.github.games647.fastlogin.core.shared.LoginMethodDecider.AccountState.READ_FAILURE;
+            logger.warn("Could not read the account state of {}; keeping the password lock",
+                    playerName, readError);
+        }
+        com.github.games647.fastlogin.protocol.IdentityClaim.Facts declared = facts == null
+                ? com.github.games647.fastlogin.protocol.IdentityClaim.Facts.defaults() : facts;
+        boolean autoLogin = com.github.games647.fastlogin.core.shared.LoginMethodDecider.resolvePolicyValue(
+                declared.policyDeclared(), declared.autoLogin(),
+                () -> getConfig().getBoolean("autoLogin"));
+        boolean autoRegisterUnknown =
+                com.github.games647.fastlogin.core.shared.LoginMethodDecider.resolvePolicyValue(
+                        declared.policyDeclared(), declared.autoRegisterUnknown(),
+                        () -> getConfig().getBoolean("auto-register-unknown"));
+        com.github.games647.fastlogin.core.shared.LoginMethodDecider.Outcome outcome =
+                com.github.games647.fastlogin.core.shared.LoginMethodDecider.decide(
+                        verified, account, declared.consent(), autoLogin, autoRegisterUnknown);
+        if (outcome == com.github.games647.fastlogin.core.shared.LoginMethodDecider.Outcome.REJECT) {
+            String reason = core.getMessage("ownership-conflict");
+            if (connection != null) {
+                disconnectConfiguration(playerName, connection, reason);
+            } else {
+                denyLogin(playerName, reason);
+            }
+            return false;
+        }
+        if (outcome != com.github.games647.fastlogin.core.shared.LoginMethodDecider.Outcome.AUTO_REGISTER_LOGIN
+                && outcome != com.github.games647.fastlogin.core.shared.LoginMethodDecider.Outcome.AUTO_LOGIN) {
+            debugLog("Keeping the auth plugin's own login flow for {} (decision {})",
+                    playerName, outcome);
+            if (verified && facts != null
+                    && account == com.github.games647.fastlogin.core.shared.LoginMethodDecider
+                            .AccountState.PASSWORD_ACCOUNT) {
+                queuePasswordNotice(address, playerName, "premium-password-login");
+                debugLog("Queued premium-password-login for {} (address={})", playerName, address);
+            } else if (outcome == com.github.games647.fastlogin.core.shared.LoginMethodDecider.Outcome.PASSWORD
+                    && verified && !autoLogin
+                    && account == com.github.games647.fastlogin.core.shared.LoginMethodDecider
+                            .AccountState.PREMIUM_OWNED) {
+                debugLog("AuthMe placeholder release policy for {}: source={} autoLogin=false",
+                        playerName, declared.policyDeclared() ? "proxy declaration" : "local configuration");
+                AuthMePremiumIntegrator integrator = getAuthMePremiumIntegrator();
+                AuthMePremiumIntegrator.ReleaseOutcome release = integrator == null
+                        ? AuthMePremiumIntegrator.ReleaseOutcome.UNSUPPORTED
+                        : integrator.releaseUnusablePlaceholder(playerName, verifiedPremiumUuid);
+                if (release == AuthMePremiumIntegrator.ReleaseOutcome.RELEASED
+                        || release == AuthMePremiumIntegrator.ReleaseOutcome.ALREADY_ABSENT) {
+                    clearPasswordNotice(address, playerName);
+                    integrator.closePreJoinRegisterDialog(connectionUuid, connection);
+                    integrator.closePreJoinLoginDialog(connectionUuid, connection);
+                } else if (release == AuthMePremiumIntegrator.ReleaseOutcome.UUID_MISMATCH) {
+                    clearPasswordNotice(address, playerName);
+                    integrator.closePreJoinRegisterDialog(connectionUuid, connection);
+                    integrator.closePreJoinLoginDialog(connectionUuid, connection);
+                    String reason = core.getMessage("ownership-conflict");
+                    if (connection != null) {
+                        disconnectConfiguration(playerName, connection, reason);
+                    } else {
+                        denyLogin(playerName, reason);
+                    }
+                } else if (facts != null) {
+                    queuePasswordNotice(address, playerName, "premium-policy-disabled");
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Refuses a login on platforms without a configuration connection.
+     *
+     * @param playerName the player to refuse
+     * @param message    the localized reason
+     */
+    void denyLogin(String playerName, String message) {
+        pendingKicks.put(playerName, message);
+        Player online = Bukkit.getPlayerExact(playerName);
+        if (online != null) {
+            online.kickPlayer(message);
+        }
+    }
+
+    /**
+     * Takes the pending kick message for a joining player, if any.
+     *
+     * @param playerName the joining player's name
+     * @return the kick message, or null when this player may stay
+     */
+    public String takePendingKick(String playerName) {
+        return pendingKicks.remove(playerName);
+    }
+
+    private final com.google.common.cache.Cache<java.net.InetSocketAddress, String> passwordNotices =
+            com.google.common.cache.CacheBuilder.newBuilder().maximumSize(10000)
+                    .expireAfterWrite(2, java.util.concurrent.TimeUnit.MINUTES).build();
+
+    /** Fallback key for platforms that reach login before a socket address exists (Spigot). */
+    private final com.google.common.cache.Cache<String, String> passwordNoticesByName =
+            com.google.common.cache.CacheBuilder.newBuilder().maximumSize(10000)
+                    .expireAfterWrite(2, java.util.concurrent.TimeUnit.MINUTES).build();
+
+    private void clearPasswordNotice(java.net.InetSocketAddress address, String playerName) {
+        if (address != null) {
+            passwordNotices.invalidate(address);
+        }
+        passwordNoticesByName.invalidate(playerName.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * Queues the explanation for delivery at join. The client socket address carries the port and
+     * is only readable once the connection is attached; a platform without a configuration phase
+     * reaches login before that, so the player name is the fallback key.
+     *
+     * @param address the client address, or null when it is not readable yet
+     * @param playerName the connecting player name
+     * @param key the message key to deliver
+     */
+    private void queuePasswordNotice(java.net.InetSocketAddress address, String playerName, String key) {
+        if (address != null) {
+            passwordNotices.put(address, key);
+        } else {
+            passwordNoticesByName.put(playerName.toLowerCase(java.util.Locale.ROOT), key);
+        }
+    }
+
+    private String takePasswordNotice(org.bukkit.entity.Player player) {
+        java.net.InetSocketAddress address = player.getAddress();
+        String notice = address == null ? null : passwordNotices.asMap().remove(address);
+        return notice != null ? notice
+                : passwordNoticesByName.asMap().remove(player.getName().toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * Sends the explanation at most once for this player connection.
+     *
+     * @param player the player on its owning thread
+     */
+    public void sendPasswordNotice(Player player) {
+        String key = "flp-password-notice";
+        if (!player.hasMetadata(key)) {
+            player.setMetadata(key, new org.bukkit.metadata.FixedMetadataValue(this, true));
+            core.sendLocaleMessage("premium-password-login", player);
+        }
+    }
+
+    /**
+     * Explains policy-disabled premium recovery at most once per connection.
+     *
+     * @param player the player on its owning thread
+     */
+    public void sendPremiumPolicyNotice(Player player) {
+        String key = "flp-premium-policy-notice";
+        if (!player.hasMetadata(key)) {
+            player.setMetadata(key, new org.bukkit.metadata.FixedMetadataValue(this, true));
+            core.sendLocaleMessage("premium-policy-disabled", player);
+        }
+    }
+
+    /**
+     * Consumes configure-phase work on the joining player's owning thread.
+     *
+     * @param player the joining player
+     * @return whether the player may continue to the auth flow
+     */
+    public boolean deliverPendingLogin(Player player) {
+        String denied = takePendingKick(player.getName());
+        if (denied != null) {
+            player.kickPlayer(denied);
+            return false;
+        }
+        String notice = takePasswordNotice(player);
+        debugLog("Pending login notice for {} at {}: {}", player.getName(), player.getAddress(), notice);
+        if ("premium-policy-disabled".equals(notice)) {
+            sendPremiumPolicyNotice(player);
+        } else if (notice != null) {
+            sendPasswordNotice(player);
+        }
+        return true;
+    }
+
+    private void disconnectConfiguration(String playerName, Object connection, String reason) {
+        try {
+            Class<?> component = Class.forName("net.kyori.adventure.text.Component");
+            Class<?> serializer = Class.forName("net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer");
+            Object legacy = serializer.getMethod("legacySection").invoke(null);
+            Object message = serializer.getMethod("deserialize", String.class).invoke(legacy, reason);
+            Class.forName("io.papermc.paper.connection.PlayerConnection")
+                    .getMethod("disconnect", component).invoke(connection, message);
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError failure) {
+            logger.error("Could not disconnect the configuration connection for {}; deferring rejection to join",
+                    playerName, failure);
+            denyLogin(playerName, reason);
+        }
+    }
+
+    /**
+     * Seeds the login session for a granted premium login. The facts may be
+     * absent (no early channel, or a claim that did not pass validation): the
+     * session then keeps the conservative defaults instead of failing.
+     *
+     * @param playerName the player name
+     * @param premiumUuid the verified Mojang UUID
+     * @param facts      the declared facts, or null when none were declared
+     * @return the session to register for the force-login task
+     */
+    static BukkitLoginSession newPremiumSession(String playerName, java.util.UUID premiumUuid,
+            com.github.games647.fastlogin.protocol.IdentityClaim.Facts facts) {
+        BukkitLoginSession session = new BukkitLoginSession(playerName, true);
+        session.setUuid(premiumUuid);
+        session.setVerifiedPremium(true);
+        if (facts != null) {
+            session.setFacts(facts);
+        }
+        return session;
     }
 
     /**
