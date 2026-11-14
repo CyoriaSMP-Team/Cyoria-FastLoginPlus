@@ -136,7 +136,13 @@ public final class AuthMeProxyPin {
      * @return whether the configuration/consumer shape has been reviewed for this version
      */
     public static boolean isReviewedVersion(String version) {
-        return version != null && version.matches("6\\.0\\.1(?:[-+].*)?");
+        // Reviewed: upstream AuthMe 6.0.1 (any qualifier) plus Cyoria's own
+        // 6.0.2-SNAPSHOT-bCUSTOM build, whose BungeeReceiver/HooksSettings shape
+        // was verified identical. The pin itself re-verifies every reflective
+        // step at runtime, so an unexpected shape fails safe instead of
+        // silently doing the wrong thing.
+        return version != null
+                && (version.matches("6\\.0\\.1(?:[-+].*)?") || version.equals("6.0.2-SNAPSHOT-bCUSTOM"));
     }
 
     /**

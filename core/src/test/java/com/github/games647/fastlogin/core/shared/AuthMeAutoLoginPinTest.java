@@ -114,6 +114,7 @@ class AuthMeAutoLoginPinTest {
     void onlyReviewedVersionAcceptsBuildSuffixes() {
         assertTrue(AuthMeProxyPin.isReviewedVersion("6.0.1"));
         assertTrue(AuthMeProxyPin.isReviewedVersion("6.0.1-b2770"));
+        assertTrue(AuthMeProxyPin.isReviewedVersion("6.0.2-SNAPSHOT-bCUSTOM"));
         assertFalse(AuthMeProxyPin.isReviewedVersion("6.0.10"));
         assertFalse(AuthMeProxyPin.isReviewedVersion("6.0.0"));
         assertFalse(AuthMeProxyPin.isReviewedVersion(null));
