@@ -95,6 +95,17 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                 boolean premiumName = profile.isOnlinemodePreferred()
                         || (profile.getId() != null && !observedCracked);
                 if (premiumName) {
+                    // During a confirmed Mojang session-service outage, allow a previously known
+                    // premium name to enter only the auth plugin's password flow. The backend
+                    // explicitly requires an existing password account; premium-owned/empty-password
+                    // records and unknown names are rejected there.
+                    if (core.isSessionAuthenticationOutage()) {
+                        if (isValidUsername(source, profile)) {
+                            startAuthenticationOutageSession(source, profile, username);
+                        }
+                        return null;
+                    }
+
                     // the cracked fallback only applies to names without consent: a
                     // consented name is verified on every connection (an impostor can
                     // never drag it into the password flow), while a name whose premium
@@ -204,13 +215,14 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                 }
 
                 if (!checkedPremium) {
-                    // "could not tell": a lookup that never completed —
-                    // rate limit, network trouble or an interruption — says
-                    // nothing about the name. It must not degrade the player
-                    // into the password flow: a new premium player would then
-                    // register a password account without the premium UUID
-                    // observation, and per the routing would never verify again
-                    // (the passwordless login would be lost for good).
+                    // A failed name lookup does not prove that the username is offline/cracked.
+                    // Only open the password fallback when the separate session endpoint also
+                    // fails its reachability probe. Existing AuthMe password accounts are then
+                    // admitted by the backend; unknown or premium-owned accounts are rejected.
+                    if (!booleanConfig("offline-whitelist") && core.detectSessionAuthenticationOutage()) {
+                        startAuthenticationOutageSession(source, profile, username);
+                        return;
+                    }
                     core.getPlugin().getLog().warn(
                             "Could not determine whether {} owns a premium account: the Mojang"
                                     + " lookup did not complete. Refusing to guess.", username);
@@ -328,6 +340,14 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
     public abstract void requestPremiumLogin(S source, StoredProfile profile, String username, boolean registered);
 
     public abstract void startCrackedSession(S source, StoredProfile profile, String username);
+
+    /**
+     * Starts the explicitly marked, password-only session used during a confirmed
+     * Mojang session-service outage. Platforms without this opt-in stay fail-closed.
+     */
+    protected void startAuthenticationOutageSession(S source, StoredProfile profile, String username) {
+        source.kick(core.getMessage("auth-server-unreachable"));
+    }
 
     /**
      * Whether the configured cracked fallback is active ({@code secondAttemptCracked}).
