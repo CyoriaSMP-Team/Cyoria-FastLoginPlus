@@ -166,6 +166,7 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
             }
 
             Optional<Profile> premiumUUID = Optional.empty();
+            boolean mojangProfileRateLimited = false;
             if (booleanConfig("nameChangeCheck") || booleanConfig("autoRegister")
                     || booleanConfig("offline-whitelist")) {
                 int retryCount = Math.max(1, intConfig("mojang-retry-count"));
@@ -178,6 +179,7 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                         checkedPremium = true;
                         break;
                     } catch (RateLimitException rateLimitEx) {
+                        mojProfileRateLimited = true;
                         core.getPlugin().getLog().error(
                                 "Mojang's rate limit reached for {}."
                                         + " The public IPv4 address of this server issued"
@@ -219,7 +221,12 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                     // Only open the password fallback when the separate session endpoint also
                     // fails its reachability probe. Existing AuthMe password accounts are then
                     // admitted by the backend; unknown or premium-owned accounts are rejected.
-                    if (!booleanConfig("offline-whitelist") && core.detectSessionAuthenticationOutage()) {
+                    if (!booleanConfig("offline-whitelist")
+                            && (mojangProfileRateLimited || core.detectSessionAuthenticationOutage())) {
+                        if (mojangProfileRateLimited) {
+                            core.getPlugin().getLog().warn("Mojang name lookup was rate-limited for {}; "
+                                    + "using the password-only AuthMe outage path", username);
+                        }
                         startAuthenticationOutageSession(source, profile, username);
                         return;
                     }
