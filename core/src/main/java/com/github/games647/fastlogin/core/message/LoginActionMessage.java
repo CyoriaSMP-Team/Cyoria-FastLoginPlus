@@ -87,7 +87,8 @@ public class LoginActionMessage implements ChannelMessage {
         boolean offline = type == Type.CRACKED;
         boolean outagePassword = type == Type.AUTH_OUTAGE;
         if (outagePassword && declaration == null) {
-            throw new IllegalArgumentException("Outage-password declaration requires an authenticated identity payload");
+            throw new IllegalArgumentException(
+                    "Outage-password declaration requires an authenticated identity payload");
         }
         if ((offline || outagePassword) && verifiedPremiumUuid != null) {
             throw new IllegalArgumentException("Unverified declaration cannot carry a premium UUID");
