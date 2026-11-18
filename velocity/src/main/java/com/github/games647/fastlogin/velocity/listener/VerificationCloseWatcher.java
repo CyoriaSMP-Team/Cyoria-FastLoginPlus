@@ -116,7 +116,11 @@ public final class VerificationCloseWatcher {
                     .invoke(sessionConnection);
             switch (classifyHandler(handler)) {
                 case AUTH_FAILED:
-                    plugin.getCore().settleVerificationAsFailure(username, connection);
+                    // Never block Netty's close callback with Mojang HTTP I/O. The resolver
+                    // probe distinguishes an invalid session (service reachable) from a
+                    // session-service outage before deciding whether password fallback is safe.
+                    plugin.getScheduler().runAsync(
+                            () -> plugin.getCore().settleVerificationAsFailure(username, connection));
                     break;
                 case NOT_ANSWERED:
                 default:

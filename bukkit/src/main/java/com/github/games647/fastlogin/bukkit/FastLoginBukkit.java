@@ -1275,7 +1275,7 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
                 connectionUuid, false);
     }
 
-    private com.github.games647.fastlogin.protocol.IdentityClaim validateIdentityDeclaration(
+    com.github.games647.fastlogin.protocol.IdentityClaim validateIdentityDeclaration(
             java.util.List<String> values, java.util.List<String> signatures, String playerName,
             UUID connectionUuid, boolean consumeNonce) {
         try {

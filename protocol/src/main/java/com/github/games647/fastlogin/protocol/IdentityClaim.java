@@ -38,7 +38,9 @@ public final class IdentityClaim {
 
     /** The proxy decision for this particular connection. */
     public enum Decision {
-        OFFLINE, PREMIUM_VERIFIED, UNDECIDED
+        OFFLINE, PREMIUM_VERIFIED, UNDECIDED,
+        /** Proxy-confirmed session-service outage; backend must require an existing password account. */
+        AUTH_OUTAGE_PASSWORD
     }
 
     /** Upgrade consent of the name's FastLoginPlus record. */
@@ -480,6 +482,10 @@ public final class IdentityClaim {
      */
     public static IdentityClaim parseForFabric(Iterable<String> values, String expectedName, UUID expectedUuid) {
         IdentityClaim claim = parseExactlyOne(values, expectedName, expectedUuid);
+        if (claim.decision == Decision.AUTH_OUTAGE_PASSWORD) {
+            throw new IllegalArgumentException(
+                    "Auth outage password fallback is supported only by the AuthMe Bukkit backend");
+        }
         if (claim.decision == Decision.UNDECIDED) {
             throw new IllegalArgumentException("Identity decision is unresolved");
         }

@@ -157,6 +157,12 @@ ip-addresses:
 # and requires at least one HTTP proxy below, otherwise the limit resets to 600.
 mojang-request-limit: 600
 
+# Allow a registered AuthMe password account to use /login when Mojang name
+# lookup is explicitly rate-limited (HTTP 429), or the session-service probe
+# confirms an authentication outage after a failed premium handshake. The backend only
+# accepts an existing PASSWORD_ACCOUNT; unknown and premium-owned accounts fail closed.
+auth-outage-password-fallback: true
+
 # ========================================
 # Floodgate / Bedrock
 # ========================================

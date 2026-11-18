@@ -16,10 +16,12 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /**
  * Offline tests for the {@code mojang-request-limit} handling.  The old implementation turned every
@@ -41,6 +43,32 @@ class MojangResolverRateLimitTest {
     @AfterEach
     void tearDown() {
         endpoints.close();
+    }
+
+
+    @Test
+    void retriesSessionVerificationAfterRateLimit() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        endpoints.setPrimary(name -> calls.incrementAndGet() == 1
+                ? LocalHttp.Reply.status(429)
+                : LocalHttp.Reply.raw(200, "{\"id\":\"069a79f444e94726a5befca90e38aaf5\",\"name\":\"Notch\",\"properties\":[]}"));
+        resolver.hasJoinedUrlRaw = endpoints.primaryUrl() + "?username=%s&serverId=%s";
+
+        assertTrue(resolver.hasJoined("Notch", "hash", null).isPresent());
+        assertEquals(2, calls.get(), "a single 429 should be retried and then verified");
+    }
+
+    @Test
+    void doesNotRetryDefinitiveNotFoundSessionResponse() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        endpoints.setPrimary(name -> {
+            calls.incrementAndGet();
+            return LocalHttp.Reply.status(404);
+        });
+        resolver.hasJoinedUrlRaw = endpoints.primaryUrl() + "?username=%s&serverId=%s";
+
+        assertFalse(resolver.hasJoined("Notch", "hash", null).isPresent());
+        assertEquals(1, calls.get(), "404 is a definitive negative result, not a transient rate limit");
     }
 
     @Test

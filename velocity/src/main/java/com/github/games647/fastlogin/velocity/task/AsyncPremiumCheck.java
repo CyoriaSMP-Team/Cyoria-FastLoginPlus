@@ -86,4 +86,15 @@ public class AsyncPremiumCheck extends JoinManagement<Player, CommandSource, Vel
         plugin.getSession().put(source.getConnection().getRemoteAddress(), session);
         source.enableOfflinemode();
     }
+
+    @Override
+    protected void startAuthenticationOutageSession(VelocityLoginSource source, StoredProfile profile,
+                                                     String username) {
+        VelocityLoginSession session = new VelocityLoginSession(username, false, profile);
+        session.setIdentityDecision(Decision.AUTH_OUTAGE_PASSWORD);
+        plugin.getSession().put(source.getConnection().getRemoteAddress(), session);
+        source.enableOfflinemode();
+        plugin.getLog().warn("Allowing {} to continue in password-only mode after a Mojang session-service outage; "
+                + "the backend must verify an existing AuthMe password account", username);
+    }
 }

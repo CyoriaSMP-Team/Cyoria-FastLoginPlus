@@ -195,6 +195,9 @@ class IdentityClaimTest {
         assertThrows(IllegalArgumentException.class, () -> IdentityClaim.parseForFabric(
                 Collections.singletonList(new IdentityClaim(IdentityClaim.Decision.OFFLINE,
                         "Player_1", FORWARDED, null).encode()), "Player_1", FORWARDED));
+        assertThrows(IllegalArgumentException.class, () -> IdentityClaim.parseForFabric(
+                Collections.singletonList(new IdentityClaim(IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD,
+                        "Player_1", FORWARDED, null).encode()), "Player_1", FORWARDED));
     }
 
     @Test

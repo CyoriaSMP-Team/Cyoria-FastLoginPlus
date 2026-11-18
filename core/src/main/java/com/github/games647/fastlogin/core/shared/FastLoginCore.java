@@ -79,6 +79,7 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
     static final long SESSION_PROBE_CACHE_MS = 60_000L;
 
     static final long VERIFICATION_GRACE_MS = 30_000L;
+    private static final long SESSION_OUTAGE_COOLDOWN_MS = Duration.ofMinutes(2).toMillis();
 
     private volatile Map<String, String> localeMessages = Collections.emptyMap();
 
@@ -97,6 +98,8 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
     // Session-server reachability probe (see SessionServerProbe);
     // created with the resolver in load()
     private SessionServerProbe sessionProbe;
+    /** Short circuit-breaker window after the session server is confirmed unreachable. */
+    private volatile long sessionOutageUntil;
 
     // The settlement sweep is a self-chaining delayed task (the same
     // idiom as the relay retry), started with the storage and stopped at close
@@ -749,9 +752,27 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
      */
     public boolean settleVerificationAsFailure(String username, Object owner) {
         String key = attemptKey(username);
+        PendingVerification candidate = pendingVerifications.get(key);
+        if (candidate == null || candidate.owner != owner) {
+            return false;
+        }
+
+        // A failed online-mode handshake is ambiguous: the player's session may be invalid,
+        // or Mojang's session service may be unavailable. Probe off the Netty close callback
+        // (the Velocity watcher schedules this method on the async plugin scheduler).
+        if (isAuthOutagePasswordFallbackEnabled() && sessionProbe != null && !sessionProbe.probeNow()) {
+            sessionOutageUntil = verificationClock.getAsLong() + SESSION_OUTAGE_COOLDOWN_MS;
+            if (pendingVerifications.remove(key, candidate)) {
+                plugin.getLog().warn("Mojang session verification for {} failed while the session service "
+                        + "is unreachable; enabling password-only outage fallback for {} ms",
+                        key, SESSION_OUTAGE_COOLDOWN_MS);
+            }
+            return false;
+        }
+
         boolean[] counted = {false};
         pendingVerifications.computeIfPresent(key, (pendingKey, pending) -> {
-            if (pending.owner != owner) {
+            if (pending != candidate || pending.owner != owner) {
                 return pending;
             }
             definiteFailures.merge(pendingKey, 1, Integer::sum);
@@ -759,10 +780,52 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
             return null;
         });
         if (counted[0]) {
-            plugin.getLog().warn("Premium verification for {} failed before the player was created: "
+            plugin.getLog().warn("Premium verification for {} failed while the session service is reachable: "
                     + "counted as a failed verification", key);
         }
         return counted[0];
+    }
+
+    /**
+     * Whether the proxy-side, password-only outage fallback is configured.
+     *
+     * @return true when the fallback is enabled
+     */
+    public boolean isAuthOutagePasswordFallbackEnabled() {
+        return config != null && config.getBoolean("auth-outage-password-fallback", true);
+    }
+
+    /**
+     * Whether a recent session-server probe has confirmed an authentication outage.
+     *
+     * @return true while the outage cooldown is active
+     */
+    public boolean isSessionAuthenticationOutage() {
+        return isAuthOutagePasswordFallbackEnabled()
+                && sessionOutageUntil > verificationClock.getAsLong();
+    }
+
+    /**
+     * Probes the session service after a name-lookup failure. A name lookup failure alone
+     * is not enough to open offline login: the separate session endpoint must also be
+     * unreachable. This method is called only from FLP's asynchronous login worker.
+     *
+     * @return true when the separate session-server probe confirms an outage
+     */
+    public boolean detectSessionAuthenticationOutage() {
+        if (!isAuthOutagePasswordFallbackEnabled()) {
+            return false;
+        }
+        if (isSessionAuthenticationOutage()) {
+            return true;
+        }
+        if (sessionProbe != null && !sessionProbe.probeNow()) {
+            sessionOutageUntil = verificationClock.getAsLong() + SESSION_OUTAGE_COOLDOWN_MS;
+            plugin.getLog().warn("Mojang session service is unreachable; password-only outage fallback is active "
+                    + "for {} ms", SESSION_OUTAGE_COOLDOWN_MS);
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -860,8 +923,10 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
                 plugin.getLog().warn("Premium verification for {} never completed while the session "
                         + "server answers: counted as a failed verification", key);
             } else {
+                sessionOutageUntil = now + SESSION_OUTAGE_COOLDOWN_MS;
                 plugin.getLog().warn("Premium verification for {} never completed and the session "
-                        + "server is unreachable: treated as an authentication outage, nothing recorded", key);
+                        + "server is unreachable: treated as an authentication outage; password-only fallback "
+                        + "is active for {} ms", key, SESSION_OUTAGE_COOLDOWN_MS);
             }
             return null;
         });

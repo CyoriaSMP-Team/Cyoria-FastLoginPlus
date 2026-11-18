@@ -57,9 +57,14 @@ public class ForceLoginTask
         super.run();
         if (!isOnlineMode()) {
             session.setAlreadySaved(true);
-            if (session.getIdentityDecision()
-                    == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE && isOnline(player)) {
-                sendDeclaration(Type.CRACKED, session);
+            if (isOnline(player)) {
+                if (session.getIdentityDecision()
+                        == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE) {
+                    sendDeclaration(Type.CRACKED, session);
+                } else if (session.getIdentityDecision()
+                        == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD) {
+                    sendDeclaration(Type.AUTH_OUTAGE, session);
+                }
             }
         }
     }
@@ -114,7 +119,8 @@ public class ForceLoginTask
 
     private void sendDeclaration(Type type, LoginSession session) {
         session.computeFacts(core);
-        if (type != Type.CRACKED && !session.getFacts().autoLogin()) {
+        boolean unverified = type == Type.CRACKED || type == Type.AUTH_OUTAGE;
+        if (!unverified && !session.getFacts().autoLogin()) {
             // The unchanged profile claim still carries identity and policy. Old backends must see no force intent.
             if (core.isDebug()) {
                 core.getPlugin().getLog().info("Not sending force {} for {}: proxy auto-login policy is disabled",
@@ -134,14 +140,20 @@ public class ForceLoginTask
         // premium signal at all. Null when this connection was not verified as premium.
         // The trailing facts are the proxy's observations plus the recorded upgrade
         // consent; the backend decides the login method from them.
-        UUID verified = type == Type.CRACKED ? null : session.getUuid();
+        UUID verified = unverified ? null : session.getUuid();
         LoginActionMessage loginMessage = new LoginActionMessage(type, player.getUsername(), proxyId, verified);
         loginMessage.setFacts(session.getFacts());
-        loginMessage.setDeclaration(type == Type.CRACKED
-                ? com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE
-                : verified == null ? com.github.games647.fastlogin.protocol.IdentityClaim.Decision.UNDECIDED
-                : com.github.games647.fastlogin.protocol.IdentityClaim.Decision.PREMIUM_VERIFIED,
-                player.getUniqueId(), session.isBedrockVerified());
+        com.github.games647.fastlogin.protocol.IdentityClaim.Decision decision;
+        if (type == Type.CRACKED) {
+            decision = com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE;
+        } else if (type == Type.AUTH_OUTAGE) {
+            decision = com.github.games647.fastlogin.protocol.IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD;
+        } else {
+            decision = verified == null
+                    ? com.github.games647.fastlogin.protocol.IdentityClaim.Decision.UNDECIDED
+                    : com.github.games647.fastlogin.protocol.IdentityClaim.Decision.PREMIUM_VERIFIED;
+        }
+        loginMessage.setDeclaration(decision, player.getUniqueId(), session.isBedrockVerified());
         core.getPlugin().sendPluginMessage(server, loginMessage);
     }
 
