@@ -38,7 +38,9 @@ public final class IdentityClaim {
 
     /** The proxy decision for this particular connection. */
     public enum Decision {
-        OFFLINE, PREMIUM_VERIFIED, UNDECIDED
+        OFFLINE, PREMIUM_VERIFIED, UNDECIDED,
+        /** Proxy-confirmed session-service outage; backend must require an existing password account. */
+        AUTH_OUTAGE_PASSWORD
     }
 
     /** Upgrade consent of the name's FastLoginPlus record. */
