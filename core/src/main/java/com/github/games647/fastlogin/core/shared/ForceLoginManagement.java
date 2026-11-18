@@ -159,9 +159,11 @@ public abstract class ForceLoginManagement<P extends C, C, L extends LoginSessio
                                 + "conservative behaviour", playerName);
             }
             boolean autoLogin = resolveAutoLogin(session);
+            boolean authOutagePasswordFallback = session.getIdentityDecision()
+                    == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD;
             LoginMethodDecider.Outcome outcome = LoginMethodDecider.decide(isOnlineMode(), account,
                     session.getFacts().consent(), autoLogin,
-                    resolveAutoRegisterUnknown(session));
+                    resolveAutoRegisterUnknown(session), authOutagePasswordFallback);
             switch (outcome) {
                 case AUTO_REGISTER_LOGIN:
                     premiumHandlingAllowed = true;
