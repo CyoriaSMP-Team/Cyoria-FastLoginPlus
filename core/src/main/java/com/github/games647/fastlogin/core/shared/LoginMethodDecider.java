@@ -145,8 +145,22 @@ public final class LoginMethodDecider {
      */
     public static Outcome decide(boolean verifiedPremium, AccountState account, Consent consent,
                                  boolean autoLogin, boolean autoRegisterUnknown) {
+        return decide(verifiedPremium, account, consent, autoLogin, autoRegisterUnknown, false);
+    }
+
+    /**
+     * Outage fallback is deliberately narrower than an ordinary offline login:
+     * only an existing password-backed account may proceed. Unknown accounts and
+     * AuthMe premium-owned accounts (which may have no usable password) are rejected.
+     */
+    public static Outcome decide(boolean verifiedPremium, AccountState account, Consent consent,
+                                 boolean autoLogin, boolean autoRegisterUnknown,
+                                 boolean authOutagePasswordFallback) {
         if (account == AccountState.READ_FAILURE) {
             return Outcome.PASSWORD;
+        }
+        if (authOutagePasswordFallback) {
+            return account == AccountState.PASSWORD_ACCOUNT ? Outcome.PASSWORD : Outcome.REJECT;
         }
         if (!verifiedPremium && account == AccountState.PREMIUM_OWNED) {
             // This guardrail grants nothing and must survive policy changes.
