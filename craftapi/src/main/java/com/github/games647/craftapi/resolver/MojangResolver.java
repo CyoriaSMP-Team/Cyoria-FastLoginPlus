@@ -56,6 +56,11 @@ public class MojangResolver extends AbstractResolver implements AuthResolver, Pr
      */
     public static final int MAX_NAME_REQUESTS_LIMIT = 600;
 
+    /** Maximum additional attempts after the session server responds with HTTP 429. */
+    private static final int MAX_SESSION_RATE_LIMIT_RETRIES = 3;
+    private static final long SESSION_RETRY_BASE_DELAY_MS = 500L;
+    private static final long SESSION_RETRY_MAX_DELAY_MS = 10_000L;
+
     static {
         // Try to fix https://bugs.openjdk.org/browse/JDK-8197807: the first HTTPS request of the JVM
         // pays for creating the default SSLSocketFactory, which can delay the very first login.
@@ -115,6 +120,11 @@ public class MojangResolver extends AbstractResolver implements AuthResolver, Pr
     @Override
     public Optional<Verification> hasJoined(String username, String serverHash, InetAddress hostIp)
             throws IOException {
+        return hasJoined(username, serverHash, hostIp, 0);
+    }
+
+    private Optional<Verification> hasJoined(String username, String serverHash, InetAddress hostIp, int retry)
+            throws IOException {
         String url;
         if (hostIp == null || hostIp instanceof Inet6Address) {
             // No client IP to verify against: either the caller does not have one (transparent reverse
@@ -134,6 +144,17 @@ public class MojangResolver extends AbstractResolver implements AuthResolver, Pr
         } catch (IOException connectFailure) {
             conn.disconnect();
             throw connectFailure;
+        }
+
+        if (responseCode == RateLimitException.RATE_LIMIT_RESPONSE_CODE) {
+            long retryDelay = getSessionRetryDelay(conn, retry);
+            drainQuietly(conn);
+            if (retry >= MAX_SESSION_RATE_LIMIT_RETRIES) {
+                throw new IOException("Mojang session server rate-limited verification after "
+                        + (retry + 1) + " attempts (HTTP 429)");
+            }
+            waitForSessionRetry(retryDelay);
+            return hasJoined(username, serverHash, hostIp, retry + 1);
         }
 
         if (responseCode == HttpURLConnection.HTTP_NOT_FOUND || responseCode == HttpURLConnection.HTTP_NO_CONTENT) {
@@ -351,6 +372,36 @@ public class MojangResolver extends AbstractResolver implements AuthResolver, Pr
 
         cache.addSkin(uuid, property);
         return Optional.of(property);
+    }
+
+    /**
+     * Uses Retry-After when supplied; otherwise applies bounded exponential backoff.
+     * The delay is capped so a broken or malicious response header cannot stall a login thread indefinitely.
+     */
+    private long getSessionRetryDelay(HttpURLConnection conn, int retry) {
+        long fallback = Math.min(SESSION_RETRY_MAX_DELAY_MS,
+                SESSION_RETRY_BASE_DELAY_MS * (1L << Math.min(retry, 4)));
+        String retryAfter = conn.getHeaderField("Retry-After");
+        if (retryAfter != null) {
+            try {
+                long seconds = Long.parseLong(retryAfter.trim());
+                if (seconds >= 0) {
+                    return Math.min(SESSION_RETRY_MAX_DELAY_MS, TimeUnit.SECONDS.toMillis(seconds));
+                }
+            } catch (NumberFormatException ignored) {
+                // HTTP-date values and malformed headers use the bounded local backoff.
+            }
+        }
+        return fallback;
+    }
+
+    private void waitForSessionRetry(long delayMillis) throws IOException {
+        try {
+            Thread.sleep(delayMillis);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting to retry Mojang session verification", interrupted);
+        }
     }
 
     /**
