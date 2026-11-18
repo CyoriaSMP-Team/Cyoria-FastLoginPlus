@@ -51,7 +51,7 @@ class MojangResolverRateLimitTest {
         AtomicInteger calls = new AtomicInteger();
         endpoints.setPrimary(name -> calls.incrementAndGet() == 1
                 ? LocalHttp.Reply.status(429)
-                : LocalHttp.Reply.raw(200, "{\\"id\\":\\"069a79f444e94726a5befca90e38aaf5\\",\\"name\\":\\"Notch\\",\\"properties\\":[]}"));
+                : LocalHttp.Reply.raw(200, "{\"id\":\"069a79f444e94726a5befca90e38aaf5\",\"name\":\"Notch\",\"properties\":[]}"));
         resolver.hasJoinedUrlRaw = endpoints.primaryUrl() + "?username=%s&serverId=%s";
 
         assertTrue(resolver.hasJoined("Notch", "hash", null).isPresent());
