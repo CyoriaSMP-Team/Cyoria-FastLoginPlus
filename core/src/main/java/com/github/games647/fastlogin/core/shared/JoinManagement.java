@@ -344,6 +344,10 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
     /**
      * Starts the explicitly marked, password-only session used during a confirmed
      * Mojang session-service outage. Platforms without this opt-in stay fail-closed.
+     *
+     * @param source current login source
+     * @param profile FastLoginPlus profile for this player name
+     * @param username player name being authenticated
      */
     protected void startAuthenticationOutageSession(S source, StoredProfile profile, String username) {
         source.kick(core.getMessage("auth-server-unreachable"));
