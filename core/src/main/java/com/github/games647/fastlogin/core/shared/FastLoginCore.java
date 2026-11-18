@@ -809,7 +809,7 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
         if (isSessionAuthenticationOutage()) {
             return true;
         }
-        if (sessionProbe != null && !sessionProbe.isReachable()) {
+        if (sessionProbe != null && !sessionProbe.probeNow()) {
             sessionOutageUntil = verificationClock.getAsLong() + SESSION_OUTAGE_COOLDOWN_MS;
             plugin.getLog().warn("Mojang session service is unreachable; password-only outage fallback is active "
                     + "for {} ms", SESSION_OUTAGE_COOLDOWN_MS);
