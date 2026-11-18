@@ -596,6 +596,31 @@ public class FastLoginBukkit extends JavaPlugin implements PlatformPlugin<Comman
         return loginSession.get(id);
     }
 
+    /**
+     * Whether the current player connection carries a trusted Mojang-outage password declaration.
+     * The profile check covers the window before the proxy's post-join plugin message arrives.
+     *
+     * @param player current backend player
+     * @return true only for a fresh, proxy-validated outage declaration
+     */
+    public boolean isAuthenticationOutageConnection(Player player) {
+        BukkitLoginSession session = getSession(player.spigot().getRawAddress());
+        if (session != null && session.getIdentityDecision()
+                == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD) {
+            return true;
+        }
+
+        try {
+            SpigotProfileReader.Snapshot snapshot = SpigotProfileReader.read(player);
+            com.github.games647.fastlogin.protocol.IdentityClaim claim = validateIdentityDeclaration(
+                    snapshot.claims, snapshot.signatures, player.getName(), player.getUniqueId(), false);
+            return claim != null && claim.getDecision()
+                    == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD;
+        } catch (Exception untrustedProfile) {
+            return false;
+        }
+    }
+
     public String getSessionId(InetSocketAddress address) {
         return address.getAddress().getHostAddress() + ':' + address.getPort();
     }
