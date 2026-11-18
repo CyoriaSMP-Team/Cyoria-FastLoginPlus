@@ -38,7 +38,8 @@ of auto-login.
    if `autoLogin: true` (identity-link gate is pending implementation).
 3. Java Cracked -> normal password login, no Mojang-based auto-login.
 4. Bedrock -> independent Floodgate settings; never assume Java Premium status.
-5. Bad Mojang challenge -> no auto-login, no offline fallback that steals identity.
+5. Invalid Mojang session while the session service is reachable -> no fallback; a confirmed session-service outage may use AuthMe password login only for an existing password-backed account.
+6. During the outage fallback, unknown accounts and AuthMe premium-owned accounts are rejected; no auto-register or passwordless login is allowed.
 6. Never merge playerdata/inventory from two UUIDs without account-owner proof.
 
 The upstream `LoginMethodDecider` decision table (with `LoginMethodDeciderTest`
@@ -48,3 +49,23 @@ without a local AuthMe account resolves to `GUIDE_REGISTER`, never to
 `AUTO_REGISTER_LOGIN`. Account state is read from the auth plugin itself
 (`AuthPlugin.inspectAccount`), so a session flag alone can never mint access.
 Live end-to-end tests and full Gradle integration remain required before release.
+
+
+## Mojang authentication outage fallback (Velocity)
+
+The proxy option `auth-outage-password-fallback: true` enables a bounded,
+password-only recovery path when a failed premium handshake is followed by a
+failed reachability probe to Mojang's session service. A healthy session service
+means the failure is treated as an invalid/failed session and the outage path
+stays closed.
+
+The proxy sends a dedicated `AUTH_OUTAGE` declaration to the Bukkit backend.
+The backend reads the account state from AuthMe and allows only
+`PASSWORD_ACCOUNT`; the player must complete AuthMe's normal `/login` flow.
+Unknown accounts, premium-owned accounts without a usable password, and account
+database read failures do not receive passwordless access. This is not a
+registration fallback and never changes the player's UUID or player data.
+
+Both Velocity FastLoginPlus and the Bukkit/Folia backend must run a build that
+understands the `AUTH_OUTAGE` declaration. Older backends do not understand
+that wire type and must be upgraded before enabling this option.
