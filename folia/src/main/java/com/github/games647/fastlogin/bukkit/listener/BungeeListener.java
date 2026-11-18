@@ -83,7 +83,7 @@ public class BungeeListener implements PluginMessageListener {
         // If the earlier live-profile claim was unavailable, an already authenticated carrier
         // can deliver the first policy fact. That late fallback only protects later connections.
         plugin.synchronizeAuthMePremiumPolicy(loginMessage.getFacts());
-        if (loginMessage.getType() != Type.CRACKED) {
+        if (loginMessage.getType() != Type.CRACKED && loginMessage.getType() != Type.AUTH_OUTAGE) {
             if (loginMessage.getFacts().policyDeclared() && !loginMessage.isAutoLogin()) {
                 plugin.getLog().warn("Proxy force {} for {} contradicts its disabled auto-login policy; "
                         + "applying declared policy instead", loginMessage.getType(), loginMessage.getPlayerName());
@@ -132,19 +132,20 @@ public class BungeeListener implements PluginMessageListener {
         if (plugin.getCore().isDebug()) {
             plugin.getLog().info("Player info {} command for {} from proxy", type, playerName);
         }
-        if (type != Type.CRACKED && message.getFacts().policyDeclared() && !message.isAutoLogin()) {
+        if (type != Type.CRACKED && type != Type.AUTH_OUTAGE
+                && message.getFacts().policyDeclared() && !message.isAutoLogin()) {
             // REGISTER must also reach the policy decision for existing password accounts.
             onLoginMessage(player, playerName, message);
         } else if (type == Type.LOGIN) {
             onLoginMessage(player, playerName, message);
         } else if (type == Type.REGISTER) {
             onRegisterMessage(player, playerName, message);
-        } else if (type == Type.CRACKED) {
+        } else if (type == Type.CRACKED || type == Type.AUTH_OUTAGE) {
             plugin.getPremiumPlayers().put(player.getUniqueId(), PremiumStatus.CRACKED);
             BukkitLoginSession session = new BukkitLoginSession(playerName, false);
             session.setConnectionUuid(player.getUniqueId());
             session.setFacts(message.getFacts());
-            session.setIdentityDecision(com.github.games647.fastlogin.protocol.IdentityClaim.Decision.OFFLINE);
+            session.setIdentityDecision(message.getIdentityDecision());
             session.setVerifiedPremium(false);
             startLoginTaskIfReady(player, session);
         }
