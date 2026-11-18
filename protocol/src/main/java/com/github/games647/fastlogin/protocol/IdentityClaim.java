@@ -482,6 +482,10 @@ public final class IdentityClaim {
      */
     public static IdentityClaim parseForFabric(Iterable<String> values, String expectedName, UUID expectedUuid) {
         IdentityClaim claim = parseExactlyOne(values, expectedName, expectedUuid);
+        if (claim.decision == Decision.AUTH_OUTAGE_PASSWORD) {
+            throw new IllegalArgumentException(
+                    "Auth outage password fallback is supported only by the AuthMe Bukkit backend");
+        }
         if (claim.decision == Decision.UNDECIDED) {
             throw new IllegalArgumentException("Identity decision is unresolved");
         }
