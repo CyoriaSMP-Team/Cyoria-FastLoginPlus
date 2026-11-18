@@ -72,6 +72,9 @@ public class LoginActionMessage implements ChannelMessage {
         if (type == Type.CRACKED) {
             return IdentityClaim.Decision.OFFLINE;
         }
+        if (type == Type.AUTH_OUTAGE) {
+            return IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD;
+        }
         return declaration == null ? (verifiedPremiumUuid == null ? IdentityClaim.Decision.UNDECIDED
                 : IdentityClaim.Decision.PREMIUM_VERIFIED) : declaration.getDecision();
     }
@@ -81,12 +84,15 @@ public class LoginActionMessage implements ChannelMessage {
     }
 
     private void validateDeclaration() {
-        if (type == Type.CRACKED && verifiedPremiumUuid != null) {
+        boolean offline = type == Type.CRACKED;
+        boolean outagePassword = type == Type.AUTH_OUTAGE;
+        if ((offline || outagePassword) && verifiedPremiumUuid != null) {
             throw new IllegalArgumentException("Unverified declaration cannot carry a premium UUID");
         }
         if (declaration != null) {
             IdentityClaim.Decision decision = declaration.getDecision();
-            if ((type == Type.CRACKED) != (decision == IdentityClaim.Decision.OFFLINE)
+            if (offline != (decision == IdentityClaim.Decision.OFFLINE)
+                    || outagePassword != (decision == IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD)
                     || (decision == IdentityClaim.Decision.PREMIUM_VERIFIED && verifiedPremiumUuid == null)
                     || (decision != IdentityClaim.Decision.PREMIUM_VERIFIED && verifiedPremiumUuid != null)) {
                 throw new IllegalArgumentException("Contradictory login identity declaration");
@@ -357,6 +363,9 @@ public class LoginActionMessage implements ChannelMessage {
         REGISTER,
 
         /** Unverified connection declaration; never a request to authenticate. */
-        CRACKED
+        CRACKED,
+
+        /** Mojang is unavailable; backend must accept only an existing password account. */
+        AUTH_OUTAGE
     }
 }
