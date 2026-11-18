@@ -38,9 +38,9 @@ of auto-login.
    if `autoLogin: true` (identity-link gate is pending implementation).
 3. Java Cracked -> normal password login, no Mojang-based auto-login.
 4. Bedrock -> independent Floodgate settings; never assume Java Premium status.
-5. Invalid Mojang session while the session service is reachable -> no fallback; a confirmed session-service outage may use AuthMe password login only for an existing password-backed account.
+5. Invalid Mojang session while the session service is reachable -> no fallback; a Mojang name-lookup HTTP 429 or confirmed session-service outage may use AuthMe password login only for an existing password-backed account.
 6. During the outage fallback, unknown accounts and AuthMe premium-owned accounts are rejected; no auto-register or passwordless login is allowed.
-6. Never merge playerdata/inventory from two UUIDs without account-owner proof.
+7. Never merge playerdata/inventory from two UUIDs without account-owner proof.
 
 The upstream `LoginMethodDecider` decision table (with `LoginMethodDeciderTest`
 and proxy `PolicyIntentTest` coverage) now enforces the same rule from the
@@ -54,10 +54,11 @@ Live end-to-end tests and full Gradle integration remain required before release
 ## Mojang authentication outage fallback (Velocity)
 
 The proxy option `auth-outage-password-fallback: true` enables a bounded,
-password-only recovery path when a failed premium handshake is followed by a
-failed reachability probe to Mojang's session service. A healthy session service
-means the failure is treated as an invalid/failed session and the outage path
-stays closed.
+password-only recovery path when a Mojang name-to-UUID lookup is explicitly
+rate-limited with HTTP 429, or when a failed premium handshake is followed by
+a failed reachability probe to Mojang's session service. For the handshake path,
+a reachable session service means the failure is treated as an invalid/failed
+session and the outage path stays closed.
 
 The proxy sends a dedicated `AUTH_OUTAGE` declaration to the Bukkit backend.
 The backend reads the account state from AuthMe and allows only
