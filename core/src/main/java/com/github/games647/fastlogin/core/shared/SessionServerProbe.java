@@ -43,6 +43,18 @@ public final class SessionServerProbe {
     }
 
     /**
+     * Forces a fresh network probe, bypassing a recent cached "reachable" result.
+     * Used after an actual online-mode handshake failure, where a stale positive
+     * answer could otherwise hide a newly started outage.
+     *
+     * @return true when the session server answered, false when it could not be reached
+     */
+    public synchronized boolean probeNow() {
+        cachedAt = 0L;
+        return isReachable();
+    }
+
+    /**
      * Whether the session server answers right now. A cached answer younger than
      * the cache window is reused; a first call (or an expired one) probes.
      *
