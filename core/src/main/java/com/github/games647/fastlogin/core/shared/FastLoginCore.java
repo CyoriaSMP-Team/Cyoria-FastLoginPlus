@@ -786,12 +786,20 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
         return counted[0];
     }
 
-    /** Whether the proxy-side, password-only outage fallback is configured. */
+    /**
+     * Whether the proxy-side, password-only outage fallback is configured.
+     *
+     * @return true when the fallback is enabled
+     */
     public boolean isAuthOutagePasswordFallbackEnabled() {
         return config != null && config.getBoolean("auth-outage-password-fallback", true);
     }
 
-    /** Whether a recent session-server probe has confirmed an authentication outage. */
+    /**
+     * Whether a recent session-server probe has confirmed an authentication outage.
+     *
+     * @return true while the outage cooldown is active
+     */
     public boolean isSessionAuthenticationOutage() {
         return isAuthOutagePasswordFallbackEnabled()
                 && sessionOutageUntil > verificationClock.getAsLong();
@@ -801,6 +809,8 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
      * Probes the session service after a name-lookup failure. A name lookup failure alone
      * is not enough to open offline login: the separate session endpoint must also be
      * unreachable. This method is called only from FLP's asynchronous login worker.
+     *
+     * @return true when the separate session-server probe confirms an outage
      */
     public boolean detectSessionAuthenticationOutage() {
         if (!isAuthOutagePasswordFallbackEnabled()) {
