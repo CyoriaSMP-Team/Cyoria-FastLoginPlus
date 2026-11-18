@@ -64,6 +64,13 @@ public class AuthMeHook implements AuthPlugin<Player>, PreLoginAuthPlugin, Liste
         Player player = restoreSessionEvent.getPlayer();
 
         BukkitLoginSession session = plugin.getSession(player.spigot().getRawAddress());
+        if (session != null && session.getIdentityDecision()
+                == com.github.games647.fastlogin.protocol.IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD) {
+            // An outage fallback must always prove the existing AuthMe password.
+            // Do not let AuthMe's IP-based session restore bypass the /login prompt.
+            restoreSessionEvent.setCancelled(true);
+            return;
+        }
         if (session != null && session.isVerifiedPremium()) {
             // AuthMe 6.0 with enablePremium: let AuthMe handle premium bypass itself
             // Only cancel RestoreSession if AuthMe is NOT handling premium
