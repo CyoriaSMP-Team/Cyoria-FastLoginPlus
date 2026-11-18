@@ -152,6 +152,14 @@ public final class LoginMethodDecider {
      * Outage fallback is deliberately narrower than an ordinary offline login:
      * only an existing password-backed account may proceed. Unknown accounts and
      * AuthMe premium-owned accounts (which may have no usable password) are rejected.
+     *
+     * @param verifiedPremium whether the connection passed Mojang verification
+     * @param account state reported by the authentication plugin
+     * @param consent recorded upgrade consent for the player name
+     * @param autoLogin proxy auto-login policy
+     * @param autoRegisterUnknown proxy automatic-registration policy
+     * @param authOutagePasswordFallback whether this is a confirmed outage-only session
+     * @return the login method to apply
      */
     public static Outcome decide(boolean verifiedPremium, AccountState account, Consent consent,
                                  boolean autoLogin, boolean autoRegisterUnknown,
