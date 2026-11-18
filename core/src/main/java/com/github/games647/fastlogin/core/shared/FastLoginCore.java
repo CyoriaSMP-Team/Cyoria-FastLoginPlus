@@ -760,7 +760,7 @@ public class FastLoginCore<P extends C, C, T extends PlatformPlugin<C>> {
         // A failed online-mode handshake is ambiguous: the player's session may be invalid,
         // or Mojang's session service may be unavailable. Probe off the Netty close callback
         // (the Velocity watcher schedules this method on the async plugin scheduler).
-        if (isAuthOutagePasswordFallbackEnabled() && sessionProbe != null && !sessionProbe.isReachable()) {
+        if (isAuthOutagePasswordFallbackEnabled() && sessionProbe != null && !sessionProbe.probeNow()) {
             sessionOutageUntil = verificationClock.getAsLong() + SESSION_OUTAGE_COOLDOWN_MS;
             if (pendingVerifications.remove(key, candidate)) {
                 plugin.getLog().warn("Mojang session verification for {} failed while the session service "
