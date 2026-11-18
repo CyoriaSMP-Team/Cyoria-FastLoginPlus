@@ -179,7 +179,7 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
                         checkedPremium = true;
                         break;
                     } catch (RateLimitException rateLimitEx) {
-                        mojProfileRateLimited = true;
+                        mojangProfileRateLimited = true;
                         core.getPlugin().getLog().error(
                                 "Mojang's rate limit reached for {}."
                                         + " The public IPv4 address of this server issued"
@@ -218,9 +218,8 @@ public abstract class JoinManagement<P extends C, C, S extends LoginSource> {
 
                 if (!checkedPremium) {
                     // A failed name lookup does not prove that the username is offline/cracked.
-                    // Only open the password fallback when the separate session endpoint also
-                    // fails its reachability probe. Existing AuthMe password accounts are then
-                    // admitted by the backend; unknown or premium-owned accounts are rejected.
+                    // A definitive 429 or a failed session-server probe may open the password
+                    // fallback; the backend still accepts only existing AuthMe password accounts.
                     if (!booleanConfig("offline-whitelist")
                             && (mojangProfileRateLimited || core.detectSessionAuthenticationOutage())) {
                         if (mojangProfileRateLimited) {
