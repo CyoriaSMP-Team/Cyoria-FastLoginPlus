@@ -63,7 +63,7 @@ public class AuthMeHook implements AuthPlugin<Player>, PreLoginAuthPlugin, Liste
     public void onSessionRestore(RestoreSessionEvent restoreSessionEvent) {
         Player player = restoreSessionEvent.getPlayer();
 
-        if (plugin.isAuthenticationOutageConnection(player)) {
+        if (com.github.games647.fastlogin.bukkit.AuthMeOutageConnection.isAuthenticationOutage(plugin, player)) {
             // The proxy-attested outage flow always requires the stored AuthMe password.
             // This profile check also covers the interval before the proxy plugin message arrives.
             restoreSessionEvent.setCancelled(true);
