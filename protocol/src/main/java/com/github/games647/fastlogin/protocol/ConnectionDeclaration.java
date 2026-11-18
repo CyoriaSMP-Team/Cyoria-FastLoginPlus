@@ -56,7 +56,8 @@ public final class ConnectionDeclaration {
         output.writeByte(MARKER);
         output.writeByte(VERSION);
         output.writeByte(decision == IdentityClaim.Decision.OFFLINE ? 1
-                : decision == IdentityClaim.Decision.PREMIUM_VERIFIED ? 2 : 0);
+                : decision == IdentityClaim.Decision.PREMIUM_VERIFIED ? 2
+                : decision == IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD ? 3 : 0);
         output.writeLong(forwardedUuid.getMostSignificantBits());
         output.writeLong(forwardedUuid.getLeastSignificantBits());
         // trailing: older readers stop after the UUID, so the flag is additive
@@ -75,11 +76,12 @@ public final class ConnectionDeclaration {
             throw new IllegalArgumentException("Unsupported connection declaration version");
         }
         int code = input.readUnsignedByte();
-        if (code > 2) {
+        if (code > 3) {
             throw new IllegalArgumentException("Unknown connection declaration decision");
         }
         IdentityClaim.Decision decision = code == 1 ? IdentityClaim.Decision.OFFLINE
-                : code == 2 ? IdentityClaim.Decision.PREMIUM_VERIFIED : IdentityClaim.Decision.UNDECIDED;
+                : code == 2 ? IdentityClaim.Decision.PREMIUM_VERIFIED
+                : code == 3 ? IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD : IdentityClaim.Decision.UNDECIDED;
         UUID forwardedUuid = new UUID(input.readLong(), input.readLong());
         // the flag is part of every frame this version writes; a shorter frame is
         // truncated, not a legacy frame that may silently mean "not Bedrock"
