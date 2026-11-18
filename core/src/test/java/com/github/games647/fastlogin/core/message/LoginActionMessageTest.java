@@ -36,15 +36,19 @@ class LoginActionMessageTest {
     private static final UUID PREMIUM_UUID = UUID.fromString("272cb3e9-24d3-4dcd-b47c-4b786e7421f8");
 
     @Test
-    void explicitDeclarationsRoundTripOnAllThreeExistingTypes() {
+    void explicitDeclarationsRoundTripForAllTypes() {
         UUID connection = UUID.randomUUID();
         for (Type type : Type.values()) {
             boolean offline = type == Type.CRACKED;
+            boolean outage = type == Type.AUTH_OUTAGE;
+            boolean unverified = offline || outage;
             LoginActionMessage original = new LoginActionMessage(type, "Steve", PROXY_ID,
-                    offline ? null : PREMIUM_UUID);
+                    unverified ? null : PREMIUM_UUID);
             original.setFacts(new IdentityClaim.Facts(false, true, IdentityClaim.Consent.YES, true, false, true));
-            original.setDeclaration(offline ? IdentityClaim.Decision.OFFLINE
-                    : IdentityClaim.Decision.PREMIUM_VERIFIED, connection);
+            IdentityClaim.Decision decision = offline ? IdentityClaim.Decision.OFFLINE
+                    : outage ? IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD
+                    : IdentityClaim.Decision.PREMIUM_VERIFIED;
+            original.setDeclaration(decision, connection);
             ByteArrayDataOutput output = ByteStreams.newDataOutput();
             original.writeTo(output);
             LoginActionMessage decoded = new LoginActionMessage();
@@ -54,6 +58,16 @@ class LoginActionMessageTest {
             assertEquals(connection, decoded.getForwardedUuid());
             assertEquals(IdentityClaim.Consent.YES, decoded.getConsent());
         }
+    }
+
+    @Test
+    void outagePasswordTypeRequiresItsDedicatedDeclarationAndNoPremiumUuid() {
+        LoginActionMessage message = new LoginActionMessage(Type.AUTH_OUTAGE, "Steve", PROXY_ID, null);
+        assertThrows(IllegalArgumentException.class, () -> message.writeTo(ByteStreams.newDataOutput()));
+        message.setDeclaration(IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD, UUID.randomUUID());
+        assertEquals(IdentityClaim.Decision.AUTH_OUTAGE_PASSWORD, message.getIdentityDecision());
+        LoginActionMessage forged = new LoginActionMessage(Type.AUTH_OUTAGE, "Steve", PROXY_ID, PREMIUM_UUID);
+        assertThrows(IllegalArgumentException.class, () -> forged.writeTo(ByteStreams.newDataOutput()));
     }
 
     @Test
