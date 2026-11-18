@@ -68,6 +68,25 @@ class LoginMethodDeciderTest {
     }
 
     @Test
+    void outageFallbackOnlyAllowsExistingPasswordAccounts() {
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.PASSWORD_ACCOUNT, Consent.YES,
+                        true, true, true));
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.PASSWORD_ACCOUNT, Consent.YES,
+                        false, false, true));
+        assertEquals(Outcome.REJECT,
+                LoginMethodDecider.decide(false, AccountState.NONE, Consent.YES,
+                        true, true, true));
+        assertEquals(Outcome.REJECT,
+                LoginMethodDecider.decide(false, AccountState.PREMIUM_OWNED, Consent.YES,
+                        true, true, true));
+        assertEquals(Outcome.PASSWORD,
+                LoginMethodDecider.decide(false, AccountState.READ_FAILURE, Consent.YES,
+                        true, true, true));
+    }
+
+    @Test
     void unverifiedNewNameGoesToRegistration() {
         assertEquals(Outcome.GUIDE_REGISTER,
                 LoginMethodDecider.decide(false, AccountState.NONE, Consent.UNKNOWN));
