@@ -377,6 +377,10 @@ public class MojangResolver extends AbstractResolver implements AuthResolver, Pr
     /**
      * Uses Retry-After when supplied; otherwise applies bounded exponential backoff.
      * The delay is capped so a broken or malicious response header cannot stall a login thread indefinitely.
+     *
+     * @param conn HTTP response connection
+     * @param retry zero-based retry number
+     * @return delay before the next attempt, in milliseconds
      */
     private long getSessionRetryDelay(HttpURLConnection conn, int retry) {
         long fallback = Math.min(SESSION_RETRY_MAX_DELAY_MS,
