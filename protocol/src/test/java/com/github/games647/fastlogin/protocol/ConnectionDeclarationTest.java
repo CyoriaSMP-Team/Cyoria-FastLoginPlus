@@ -37,7 +37,7 @@ class ConnectionDeclarationTest {
         assertThrows(IllegalArgumentException.class, () -> ConnectionDeclaration.readPayload(
                 new DataInputStream(new ByteArrayInputStream(new byte[]{2, 1}))));
         assertThrows(IllegalArgumentException.class, () -> ConnectionDeclaration.readPayload(
-                new DataInputStream(new ByteArrayInputStream(new byte[]{1, 3}))));
+                new DataInputStream(new ByteArrayInputStream(new byte[]{1, 4}))));
     }
 
     @Test
