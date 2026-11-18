@@ -48,6 +48,10 @@ final class IdentityDecisionPolicy {
                 decision = Decision.PREMIUM_VERIFIED;
                 verified = session.getUuid();
                 session.setIdentityDecision(decision);
+            } else if (!onlineMode && session.getIdentityDecision() == Decision.AUTH_OUTAGE_PASSWORD
+                    && session.getUsername().equals(name)
+                    && UUIDAdapter.generateOfflineId(name).equals(uuid)) {
+                decision = Decision.AUTH_OUTAGE_PASSWORD;
             } else if (!onlineMode && session.getIdentityDecision() == Decision.OFFLINE
                     && session.getUsername().equals(name)
                     && UUIDAdapter.generateOfflineId(name).equals(uuid)) {
